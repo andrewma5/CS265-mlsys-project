@@ -70,7 +70,11 @@ def graph_transformation(gm: fx.GraphModule, args: Any) -> fx.GraphModule:
         for _ in range(profile_iters):
             graph_profiler.run(*args)
     graph_profiler.aggregate_stats()
-    graph_profiler.print_stats()
+    os.makedirs("output", exist_ok=True)
+    graph_profiler.print_stats("output/dummy_model_node_stats.csv", "output/dummy_model_activation_lifecycle.csv")
+    graph_profiler.plot_memory_timeline("output/dummy_model_memory_timeline.png")
+    graph_profiler.plot_memory_breakdown("output/dummy_model_memory_breakdown.png")
+    graph_profiler.plot_memory_stacked_timeline("output/dummy_model_memory_stacked_timeline.png")
     return gm
 
 
