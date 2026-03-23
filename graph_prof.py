@@ -106,11 +106,19 @@ class GraphProfiler(fx.Interpreter):
             and self.optimizer_node.target == torch.ops.aten._fused_adam.default
         )
         if is_fused:
-            # _fused_adam args[0] = list of param nodes, args[1] = list of grad nodes
+            # _fused_adam args: [0]=params, [1]=grads, [2]=exp_avgs,
+            # [3]=exp_avg_sqs, [4]=max_exp_avg_sqs, [5]=state_steps
             param_list = self.optimizer_node.args[0]
             grad_list = self.optimizer_node.args[1]
             self.param_nodes = set(param_list) if param_list else set()
             self.grad_nodes = set(grad_list) if grad_list else set()
+            # Extract optimizer states from fused adam args
+            for arg_idx in range(2, min(6, len(self.optimizer_node.args))):
+                state_list = self.optimizer_node.args[arg_idx]
+                if state_list:
+                    for node in state_list:
+                        if hasattr(node, 'op'):
+                            self.opt_state_nodes.add(node)
         else:
             # foreach-based optimizer or no optimizer node
             for node in self.node_order:
@@ -149,10 +157,11 @@ class GraphProfiler(fx.Interpreter):
                 self.node_region[node] == 2
                 and node.op == OP.CALL_FUNCTION
             ):
-                # All call_function nodes in the backward region are computing
-                # gradients (intermediate or final). Tag them as GRAD.
+                # Backward call_function nodes are gradient computations.
+                # Tag as GRAD for display but do NOT add to self.grad_nodes
+                # (which is reserved for true parameter gradients identified
+                # in step 3 and used for activation lifecycle analysis).
                 self.node_type[node] = NodeType.GRAD
-                self.grad_nodes.add(node)
             elif (
                 self.node_region[node] in (0, 1)
                 and node.op != OP.PLACEHOLDER
@@ -658,7 +667,7 @@ class GraphProfiler(fx.Interpreter):
 
         # Convert to MB — order so ACT is on top
         mb = 1024 * 1024
-        stack_order = [NodeType.OTHER, NodeType.ACT, NodeType.PARAM, NodeType.GRAD, NodeType.OPT_STATE]
+        stack_order = [NodeType.PARAM, NodeType.GRAD, NodeType.OPT_STATE, NodeType.ACT, NodeType.OTHER]
         stacks = []
         labels = []
         stack_colors = []
