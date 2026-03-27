@@ -266,5 +266,6 @@ if __name__ == "__main__":
             exp.init_opt_states()
             compiled_fn = compile(exp.train_step, exp.graph_transformation)
             compiled_fn(exp.model, exp.optimizer, exp.example_inputs)
+            # Clear memory for next iteration
             del exp, compiled_fn
             torch.cuda.empty_cache()

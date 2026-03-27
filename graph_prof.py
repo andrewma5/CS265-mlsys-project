@@ -112,12 +112,13 @@ class GraphProfiler(fx.Interpreter):
             grad_list = self.optimizer_node.args[1]
             self.param_nodes = set(param_list) if param_list else set()
             self.grad_nodes = set(grad_list) if grad_list else set()
-            # Extract optimizer states from fused adam args
+            # Extract optimizer states (OPT_STATE) from fused adam args
             for arg_idx in range(2, min(6, len(self.optimizer_node.args))):
                 state_list = self.optimizer_node.args[arg_idx]
                 if state_list:
                     for node in state_list:
-                        if hasattr(node, 'op'):
+                        # Make sure item is an FX graph node, not plain scalar or None
+                        if hasattr(node, "op"):
                             self.opt_state_nodes.add(node)
         else:
             # foreach-based optimizer or no optimizer node
@@ -136,13 +137,16 @@ class GraphProfiler(fx.Interpreter):
                             self.grad_nodes.add(node)
                             break
 
-        # Optimizer states: placeholder nodes used ONLY in the optimizer region
-        # (e.g., Adam's exp_avg, exp_avg_sq, step tensors)
+        # Optimizer states: placeholder nodes used in the optimizer region
+        # (e.g., Adam's exp_avg, exp_avg_sq, step tensors).
+        # Step counters are used in both backward (region 2) and optimizer
+        # (region 3), so we match placeholders used in {3} or {2,3} but
+        # NOT in the forward pass (region 0).
         for node in self.node_order:
             if node.op == OP.PLACEHOLDER and node not in self.param_nodes:
                 user_regions = {self.node_region.get(u, -1) for u in node.users}
-                # Only used in optimizer region (region 3), or has no users
-                if user_regions and user_regions <= {3}:
+                # Check 0 not in to exclude parameter nodes
+                if user_regions and 3 in user_regions and 0 not in user_regions:
                     self.opt_state_nodes.add(node)
 
         # 4. Classify every node
@@ -153,10 +157,7 @@ class GraphProfiler(fx.Interpreter):
                 self.node_type[node] = NodeType.GRAD
             elif node in self.opt_state_nodes:
                 self.node_type[node] = NodeType.OPT_STATE
-            elif (
-                self.node_region[node] == 2
-                and node.op == OP.CALL_FUNCTION
-            ):
+            elif self.node_region[node] == 2 and node.op == OP.CALL_FUNCTION:
                 # Backward call_function nodes are gradient computations.
                 # Tag as GRAD for display but do NOT add to self.grad_nodes
                 # (which is reserved for true parameter gradients identified
@@ -176,8 +177,7 @@ class GraphProfiler(fx.Interpreter):
         for act_node in self.activation_nodes:
             # Last forward access: among users in regions 0/1, highest order_index
             fwd_users = [
-                u for u in act_node.users
-                if self.node_region.get(u, -1) in (0, 1)
+                u for u in act_node.users if self.node_region.get(u, -1) in (0, 1)
             ]
             if fwd_users:
                 self.last_forward_access[act_node] = max(
@@ -185,10 +185,7 @@ class GraphProfiler(fx.Interpreter):
                 )
 
             # First backward access: among users in region 2, lowest order_index
-            bwd_users = [
-                u for u in act_node.users
-                if self.node_region.get(u, -1) == 2
-            ]
+            bwd_users = [u for u in act_node.users if self.node_region.get(u, -1) == 2]
             if bwd_users:
                 self.first_backward_access[act_node] = min(
                     bwd_users, key=lambda u: self.order_index[u]
@@ -207,9 +204,7 @@ class GraphProfiler(fx.Interpreter):
     #  Activation recomputation cost estimation (static)
     # ------------------------------------------------------------------ #
 
-    def _estimate_recomputation_cost(
-        self, act_node: fx.Node
-    ) -> Tuple[int, float]:
+    def _estimate_recomputation_cost(self, act_node: fx.Node) -> Tuple[int, float]:
         """Estimate the cost to recompute an activation from its inputs.
 
         Walks backward from *act_node* through its forward-region inputs,
@@ -239,7 +234,8 @@ class GraphProfiler(fx.Interpreter):
                 num_ops += 1
                 total_time += self.avg_runtimes.get(node, 0.0)
 
-            # Expand into this node's forward-region inputs
+            # Only expand into this node's forward-region inputs
+            # Recomputation only means re-running the forward operations
             for inp in node.all_input_nodes:
                 if self.node_region.get(inp, -1) in (0, 1):
                     stack.append(inp)
@@ -272,30 +268,23 @@ class GraphProfiler(fx.Interpreter):
         return 0
 
     def run_node(self, n: fx.Node) -> Any:
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            mem_before = torch.cuda.memory_allocated()
+        torch.cuda.synchronize()
+        mem_before = torch.cuda.memory_allocated()
 
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
 
-            start.record()
-            result = super().run_node(n)
-            end.record()
+        start.record()
+        result = super().run_node(n)
+        end.record()
 
-            torch.cuda.synchronize()
+        torch.cuda.synchronize()
 
-            self.node_runtimes[n].append(start.elapsed_time(end))  # ms
-            mem_after = torch.cuda.memory_allocated()
-            self.node_mem_deltas[n].append(mem_after - mem_before)  # bytes
-            self._current_iter_mem.append(mem_after)  # timeline
-            self.node_output_sizes[n].append(self._tensor_size_bytes(result))
-        else:
-            result = super().run_node(n)
-            self.node_runtimes[n].append(0.0)
-            self.node_mem_deltas[n].append(0)
-            self._current_iter_mem.append(0)
-            self.node_output_sizes[n].append(self._tensor_size_bytes(result))
+        self.node_runtimes[n].append(start.elapsed_time(end))  # ms
+        mem_after = torch.cuda.memory_allocated()
+        self.node_mem_deltas[n].append(mem_after - mem_before)  # bytes
+        self._current_iter_mem.append(mem_after)  # timeline
+        self.node_output_sizes[n].append(self._tensor_size_bytes(result))
 
         return result
 
@@ -319,22 +308,22 @@ class GraphProfiler(fx.Interpreter):
         """Average profiling data over all recorded iterations."""
         for node in self.node_order:
             if node in self.node_runtimes and self.node_runtimes[node]:
-                self.avg_runtimes[node] = (
-                    sum(self.node_runtimes[node]) / len(self.node_runtimes[node])
+                self.avg_runtimes[node] = sum(self.node_runtimes[node]) / len(
+                    self.node_runtimes[node]
                 )
             else:
                 self.avg_runtimes[node] = 0.0
 
             if node in self.node_mem_deltas and self.node_mem_deltas[node]:
-                self.avg_mem_deltas[node] = (
-                    sum(self.node_mem_deltas[node]) / len(self.node_mem_deltas[node])
+                self.avg_mem_deltas[node] = sum(self.node_mem_deltas[node]) / len(
+                    self.node_mem_deltas[node]
                 )
             else:
                 self.avg_mem_deltas[node] = 0.0
 
             if node in self.node_output_sizes and self.node_output_sizes[node]:
-                self.avg_output_sizes[node] = (
-                    sum(self.node_output_sizes[node]) / len(self.node_output_sizes[node])
+                self.avg_output_sizes[node] = sum(self.node_output_sizes[node]) / len(
+                    self.node_output_sizes[node]
                 )
             else:
                 self.avg_output_sizes[node] = 0.0
@@ -351,9 +340,7 @@ class GraphProfiler(fx.Interpreter):
                     if i < len(self.cumulative_mem[j])
                 )
                 count = sum(
-                    1
-                    for j in range(num_iters)
-                    if i < len(self.cumulative_mem[j])
+                    1 for j in range(num_iters) if i < len(self.cumulative_mem[j])
                 )
                 self.avg_cumulative_mem.append(total / count)
 
@@ -387,6 +374,7 @@ class GraphProfiler(fx.Interpreter):
             if node.op == OP.OUTPUT:
                 continue
 
+            # Find last user of node in execution order
             last_user_idx = -1
             for user in node.users:
                 uid = self.order_index.get(user, -1)
@@ -430,10 +418,17 @@ class GraphProfiler(fx.Interpreter):
 
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([
-                "Node Name", "Op", "Type", "Region",
-                "Avg Time (ms)", "Avg Mem Delta (B)", "Output Size (B)",
-            ])
+            writer.writerow(
+                [
+                    "Node Name",
+                    "Op",
+                    "Type",
+                    "Region",
+                    "Avg Time (ms)",
+                    "Avg Mem Delta (B)",
+                    "Output Size (B)",
+                ]
+            )
             for node in self.node_order:
                 name = node.name
                 op = str(node.op)
@@ -457,7 +452,17 @@ class GraphProfiler(fx.Interpreter):
                     f"{name[:38]:<40} {op[:16]:<18} {ntype:<10} {region:<6} "
                     f"{avg_t:>14.4f} {avg_m:>18.0f} {avg_sz:>16.0f}"
                 )
-                writer.writerow([name, op, ntype, region, f"{avg_t:.4f}", f"{avg_m:.0f}", f"{avg_sz:.0f}"])
+                writer.writerow(
+                    [
+                        name,
+                        op,
+                        ntype,
+                        region,
+                        f"{avg_t:.4f}",
+                        f"{avg_m:.0f}",
+                        f"{avg_sz:.0f}",
+                    ]
+                )
 
         print(f"Node stats written to {csv_path}")
 
@@ -507,39 +512,62 @@ class GraphProfiler(fx.Interpreter):
                 first_bwd = self.first_backward_access.get(act)
                 idle_gap = -1
                 if last_fwd is not None and first_bwd is not None:
-                    idle_gap = (
-                        self.order_index[first_bwd] - self.order_index[last_fwd]
-                    )
+                    idle_gap = self.order_index[first_bwd] - self.order_index[last_fwd]
                 recomp_ops, recomp_time = self._estimate_recomputation_cost(act)
                 act_size = self.avg_output_sizes.get(act, 0.0)
                 act_data.append(
-                    (act, last_fwd, first_bwd, idle_gap, recomp_ops, recomp_time, act_size)
+                    (
+                        act,
+                        last_fwd,
+                        first_bwd,
+                        idle_gap,
+                        recomp_ops,
+                        recomp_time,
+                        act_size,
+                    )
                 )
 
             act_data.sort(key=lambda x: x[3], reverse=True)
 
             with open(act_csv_path, "w", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow([
-                    "Activation", "Size (B)", "Last Fwd Use", "First Bwd Use",
-                    "Idle Gap", "Recomp Ops", "Recomp (ms)",
-                ])
-                for act, last_fwd, first_bwd, idle_gap, recomp_ops, recomp_time, act_size in act_data:
+                writer.writerow(
+                    [
+                        "Activation",
+                        "Size (B)",
+                        "Last Fwd Use",
+                        "First Bwd Use",
+                        "Idle Gap",
+                        "Recomp Ops",
+                        "Recomp (ms)",
+                    ]
+                )
+                for (
+                    act,
+                    last_fwd,
+                    first_bwd,
+                    idle_gap,
+                    recomp_ops,
+                    recomp_time,
+                    act_size,
+                ) in act_data:
                     print(
                         f"{act.name[:30]:<32} {act_size:>10.0f} "
                         f"{(last_fwd.name[:20] if last_fwd else 'N/A'):<22} "
                         f"{(first_bwd.name[:20] if first_bwd else 'N/A'):<22} "
                         f"{idle_gap:>9} {recomp_ops:>11} {recomp_time:>12.4f}"
                     )
-                    writer.writerow([
-                        act.name,
-                        f"{act_size:.0f}",
-                        last_fwd.name if last_fwd else "N/A",
-                        first_bwd.name if first_bwd else "N/A",
-                        idle_gap,
-                        recomp_ops,
-                        f"{recomp_time:.4f}",
-                    ])
+                    writer.writerow(
+                        [
+                            act.name,
+                            f"{act_size:.0f}",
+                            last_fwd.name if last_fwd else "N/A",
+                            first_bwd.name if first_bwd else "N/A",
+                            idle_gap,
+                            recomp_ops,
+                            f"{recomp_time:.4f}",
+                        ]
+                    )
             print(f"Activation lifecycle written to {act_csv_path}")
 
         # Peak memory
@@ -551,9 +579,7 @@ class GraphProfiler(fx.Interpreter):
             )
             if total_breakdown > 0:
                 act_pct = breakdown[NodeType.ACT] / total_breakdown * 100
-                print(
-                    f"  Activations account for {act_pct:.1f}% of peak memory"
-                )
+                print(f"  Activations account for {act_pct:.1f}% of peak memory")
 
         print(f"{'='*120}\n")
 
@@ -580,14 +606,22 @@ class GraphProfiler(fx.Interpreter):
         if self.sep_node is not None:
             sep_idx = self.order_index[self.sep_node]
             ax.axvline(
-                x=sep_idx, color="green", linestyle="--", linewidth=2,
-                alpha=0.8, label="End of Forward",
+                x=sep_idx,
+                color="green",
+                linestyle="--",
+                linewidth=2,
+                alpha=0.8,
+                label="End of Forward",
             )
         if self.sep_backward_node is not None:
             sep_bwd_idx = self.order_index[self.sep_backward_node]
             ax.axvline(
-                x=sep_bwd_idx, color="red", linestyle=":", linewidth=2,
-                alpha=0.8, label="Start of Backward",
+                x=sep_bwd_idx,
+                color="red",
+                linestyle=":",
+                linewidth=2,
+                alpha=0.8,
+                label="Start of Backward",
             )
 
         ax.legend()
@@ -629,9 +663,7 @@ class GraphProfiler(fx.Interpreter):
 
         # Build per-type memory timelines using a sweep approach
         # Track alive memory per type; at each step add new node, remove dead ones
-        type_timelines: Dict[NodeType, List[float]] = {
-            nt: [0.0] * n for nt in NodeType
-        }
+        type_timelines: Dict[NodeType, List[float]] = {nt: [0.0] * n for nt in NodeType}
 
         # alive_nodes[i] = (node_type, size) for node produced at index i
         alive: List[Tuple[int, NodeType, float]] = []  # (last_user_idx, type, size)
@@ -667,7 +699,13 @@ class GraphProfiler(fx.Interpreter):
 
         # Convert to MB — order so ACT is on top
         mb = 1024 * 1024
-        stack_order = [NodeType.PARAM, NodeType.GRAD, NodeType.OPT_STATE, NodeType.ACT, NodeType.OTHER]
+        stack_order = [
+            NodeType.PARAM,
+            NodeType.GRAD,
+            NodeType.OPT_STATE,
+            NodeType.ACT,
+            NodeType.OTHER,
+        ]
         stacks = []
         labels = []
         stack_colors = []
@@ -686,13 +724,21 @@ class GraphProfiler(fx.Interpreter):
 
         if self.sep_node is not None:
             ax.axvline(
-                x=self.order_index[self.sep_node], color="green",
-                linestyle="--", linewidth=2, alpha=0.8, label="End of Forward",
+                x=self.order_index[self.sep_node],
+                color="green",
+                linestyle="--",
+                linewidth=2,
+                alpha=0.8,
+                label="End of Forward",
             )
         if self.sep_backward_node is not None:
             ax.axvline(
-                x=self.order_index[self.sep_backward_node], color="red",
-                linestyle=":", linewidth=2, alpha=0.8, label="Start of Backward",
+                x=self.order_index[self.sep_backward_node],
+                color="red",
+                linestyle=":",
+                linewidth=2,
+                alpha=0.8,
+                label="Start of Backward",
             )
 
         ax.legend(loc="upper left", fontsize=9)
@@ -735,8 +781,12 @@ class GraphProfiler(fx.Interpreter):
         for label, size, color in zip(labels, sizes_mb, bar_colors):
             pct = size / (total / (1024 * 1024)) * 100
             ax1.bar(
-                "Peak Memory", size, bottom=bottom, color=color,
-                label=f"{label} ({size:.1f} MB, {pct:.1f}%)", edgecolor="white",
+                "Peak Memory",
+                size,
+                bottom=bottom,
+                color=color,
+                label=f"{label} ({size:.1f} MB, {pct:.1f}%)",
+                edgecolor="white",
             )
             bottom += size
 
@@ -746,8 +796,12 @@ class GraphProfiler(fx.Interpreter):
 
         # Pie chart
         ax2.pie(
-            sizes_mb, labels=labels, colors=bar_colors, autopct="%1.1f%%",
-            startangle=90, textprops={"fontsize": 10},
+            sizes_mb,
+            labels=labels,
+            colors=bar_colors,
+            autopct="%1.1f%%",
+            startangle=90,
+            textprops={"fontsize": 10},
         )
         ax2.set_title("Peak Memory Distribution")
 
