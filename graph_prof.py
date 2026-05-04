@@ -201,6 +201,23 @@ class GraphProfiler(fx.Interpreter):
             )
 
     # ------------------------------------------------------------------ #
+    #  Activation lifecycle helpers
+    # ------------------------------------------------------------------ #
+
+    def last_forward_use_idx(self, act: fx.Node) -> int:
+        """Order index at which *act* is last used in the forward region.
+
+        Falls back to the activation's own index when it has no fwd-region
+        users (i.e., produced in fwd and consumed only in bwd — the tensor
+        is freed at production). The raw `last_forward_access` dict
+        intentionally omits these activations so the Phase 1 reporter can
+        render them as 'N/A'; this helper is the scheduler-facing view that
+        resolves the absence into a concrete index.
+        """
+        last = self.last_forward_access.get(act)
+        return self.order_index[last if last is not None else act]
+
+    # ------------------------------------------------------------------ #
     #  Activation recomputation cost estimation (static)
     # ------------------------------------------------------------------ #
 
