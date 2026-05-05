@@ -9,7 +9,7 @@ Algorithms E/F (Steps 5–6) will mutate these in place during the greedy loop.
 import math
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch.fx as fx
 
@@ -109,3 +109,99 @@ def build_candidates(prof: GraphProfiler) -> Dict[fx.Node, ActivationMeta]:
         )
 
     return metas
+
+
+# ---------------------------------------------------------------------------
+# Memory simulator (Algorithm G)
+# ---------------------------------------------------------------------------
+
+
+def _compute_last_users(prof: GraphProfiler) -> Dict[fx.Node, int]:
+    """Order index of each node's last consumer.
+
+    Tensors with no users (e.g., unused placeholders) are alive until end of
+    execution — we return n-1 as a fallback. Mirrors the convention used by
+    plot_memory_stacked_timeline in graph_prof.py.
+    """
+    n = len(prof.node_order)
+    last: Dict[fx.Node, int] = {}
+    for node in prof.node_order:
+        if node.op == OP.OUTPUT:
+            continue
+        lui = -1
+        for u in node.users:
+            uid = prof.order_index.get(u, -1)
+            if uid > lui:
+                lui = uid
+        last[node] = lui if lui >= 0 else n - 1
+    return last
+
+
+def simulate(
+    prof: GraphProfiler,
+    recomps: Dict[fx.Node, ActivationMeta],
+    swaps: Optional[Dict[fx.Node, ActivationMeta]] = None,
+) -> List[int]:
+    """Per-node alive-bytes timeline reflecting the given recomp/swap decisions.
+
+    Phase A — base sweep over prof.node_order, summing avg_output_sizes for
+    every tensor still alive at each index. Equivalent to summing the per-type
+    stacks in plot_memory_stacked_timeline.
+
+    Phase B — for each (act, meta) in recomps, the activation is freed at
+    meta.last_fwd_idx (instead of its baseline last_user) and its recompute
+    window is charged immediately before meta.first_bwd_idx. We use the
+    conservative whole-window approximation: charge the sum of recomp_subgraph
+    output sizes against the slot just before first_bwd_idx. This over-estimates
+    intermediate liveness inside the window — acceptable because it never
+    under-estimates the post-rewrite peak (anti-shortcut #3 in TENTATIVE_PLAN).
+
+    Swap support is deferred to later steps; non-empty `swaps` raises.
+    """
+    if swaps:
+        raise NotImplementedError("")
+
+    n = len(prof.node_order)
+    alive: List[int] = [0] * n
+    last_user = _compute_last_users(prof)
+
+    # Phase A: baseline sweep. Track (last_user_idx, size) for each live tensor.
+    live: List[Tuple[int, int]] = []
+    for i, node in enumerate(prof.node_order):
+        if i > 0:
+            alive[i] = alive[i - 1]
+        if node.op == OP.OUTPUT:
+            continue
+
+        size = int(prof.avg_output_sizes.get(node, 0))
+        if size > 0:
+            alive[i] += size
+            live.append((last_user[node], size))
+
+        # Drop tensors whose last user fired before this index.
+        still_live: List[Tuple[int, int]] = []
+        for lui, asize in live:
+            if lui < i:
+                alive[i] -= asize
+            else:
+                still_live.append((lui, asize))
+        live = still_live
+
+    # Phase B: apply recompute decisions.
+    # An activation `act` chosen for recompute is freed at last_fwd_idx instead
+    # of at its baseline last user (which sits in bwd at first_bwd_idx). So in
+    # the gap (last_fwd_idx, first_bwd_idx), we subtract its size.
+    for meta in recomps.values():
+        lo, hi = meta.last_fwd_idx, meta.first_bwd_idx
+        for k in range(lo + 1, hi):
+            alive[k] -= meta.size
+
+        # Recomputing a node requires re-executing its subgraph, which takes more
+        # memory for the intermediate tensors produced along the way.
+        window_extra = sum(
+            int(prof.avg_output_sizes.get(n_, 0)) for n_ in meta.recomp_subgraph
+        )
+        if window_extra > 0 and 0 <= hi - 1 < n:
+            alive[hi - 1] += window_extra
+
+    return alive
