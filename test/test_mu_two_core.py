@@ -14,6 +14,7 @@ from mu_two_core import (
     build_candidates,
     simulate,
     update_existing_recomps,
+    update_remaining_candidates,
 )
 
 
@@ -561,6 +562,147 @@ def test_algorithm_e_no_op_when_t_not_a_source():
     assert z4.total_recomp_time == 1 * 8.0
 
 
+# ---------------------------------------------------------------------------
+# Step 6: Algorithm F (update_remaining_candidates) — synthetic chain tests.
+# ---------------------------------------------------------------------------
+
+
+def test_algorithm_f_arm1_propagates_sources_to_downstream_candidate():
+    """Pick Z3. F arm 1 fires for Z4 (Z3 ∈ Z4.recomp_srcs):
+        Z4.recomp_srcs:        {Z3}  → {Z2}
+        Z4.recomp_time:        8.0   → 12.0   (absorbed Z3.recomp_time = 4.0)
+        Z4.total_recomp_time:  8.0   → 12.0   (refreshed: 1 × 12.0)
+        Z4.recomp_ratio:       12.5  → 100/12 ≈ 8.33
+
+    Z1 unchanged (neither arm fires: Z3 not in Z1.srcs={X}, Z1 not in
+    Z3.srcs={Z2}). Z2 hits arm 2 (Z2 ∈ Z3.srcs) but Z3.recomp_cnt=1 makes
+    the override a no-op.
+    """
+    prof, refs = _build_chain_fixture()
+    Z1, Z2, Z3, Z4 = refs["Z1"], refs["Z2"], refs["Z3"], refs["Z4"]
+    metas = build_candidates(prof)
+    z1, z2, z3, z4 = metas[Z1], metas[Z2], metas[Z3], metas[Z4]
+
+    # Pre-state.
+    assert z4.recomp_srcs == {Z3}
+    assert z4.recomp_time == 8.0
+    assert z4.total_recomp_time == 8.0
+    assert z4.recomp_ratio == 100 / 8.0
+
+    # Pick Z3.
+    candidates: Dict[fx.Node, ActivationMeta] = dict(metas)
+    candidates.pop(Z3)
+    update_remaining_candidates(z3, candidates)
+
+    # Z4: arm 1 fired.
+    assert z4.recomp_srcs == {Z2}
+    assert z4.recomp_time == 12.0
+    assert z4.total_recomp_time == 12.0
+    assert z4.recomp_cnt == 1
+    assert z4.recomp_ratio == 100 / 12.0
+    assert z4.recomp_ratio != 100 / 8.0
+
+    # Z1: untouched.
+    assert z1.recomp_srcs == {refs["X"]}
+    assert z1.recomp_time == 1.0
+    assert z1.total_recomp_time == 1.0
+
+    # Z2: arm 2 fired but overrode total to 1 × 2.0 = 2.0 (same as initial).
+    assert z2.recomp_srcs == {Z1}
+    assert z2.recomp_time == 2.0
+    assert z2.total_recomp_time == 1 * 2.0
+
+
+def test_algorithm_f_arm2_uses_t_recomp_cnt_after_E_bump():
+    """Pick Z3, then Z2. Algorithm E bumps Z2.recomp_cnt to 2 (Z3 had Z2 in its
+    srcs). F's arm 2 then fires for Z1 (Z1 ∈ Z2.srcs) using the bumped cnt:
+        Z1.total_recomp_time = Z2.recomp_cnt × Z1.recomp_time = 2 × 1.0 = 2.0
+        Z1.recomp_cnt unchanged (still 1).
+        Z1.recomp_ratio = 100 / 2.0 = 50 (was 100 initially).
+
+    This is the load-bearing arm-2 test — only observable when t.recomp_cnt > 1,
+    which requires E to have run on a prior cascade. Verifies E and F compose.
+    """
+    prof, refs = _build_chain_fixture()
+    Z1, Z2, Z3 = refs["Z1"], refs["Z2"], refs["Z3"]
+    metas = build_candidates(prof)
+    z1, z2, z3 = metas[Z1], metas[Z2], metas[Z3]
+
+    initial_z1_ratio = z1.recomp_ratio
+    assert initial_z1_ratio == 100 / 1.0  # 100
+
+    # Pick Z3.
+    candidates: Dict[fx.Node, ActivationMeta] = dict(metas)
+    candidates.pop(Z3)
+    recomps: Dict[fx.Node, ActivationMeta] = {}
+    update_existing_recomps(z3, recomps)
+    recomps[z3.node] = z3
+    update_remaining_candidates(z3, candidates)
+
+    # Pick Z2: E bumps Z2.recomp_cnt to 2.
+    candidates.pop(Z2)
+    update_existing_recomps(z2, recomps)
+    assert z2.recomp_cnt == 2
+
+    recomps[z2.node] = z2
+    update_remaining_candidates(z2, candidates)
+
+    # Arm 2 fired for Z1 with t.recomp_cnt = 2.
+    assert z1.recomp_cnt == 1
+    assert z1.recomp_time == 1.0
+    assert z1.total_recomp_time == 2 * 1.0
+    assert z1.recomp_ratio == 100 / 2.0
+    assert z1.recomp_ratio != initial_z1_ratio
+
+
+def test_algorithm_f_pick_z3_then_z2_z4_ratio_changes():
+    """The TENTATIVE_PLAN §6 gate: pick Z3 then Z2 on the chain; assert
+    Z4.recomp_ratio changed from initial. Trajectory:
+
+      Initial:           Z4.srcs={Z3}, time=8.0,  ratio=12.5
+      After picking Z3:  Z4.srcs={Z2}, time=12.0, ratio≈8.33  (arm 1)
+      After picking Z2:  Z4.srcs={Z1}, time=14.0, ratio≈7.14  (arm 1 again)
+
+    Z4 hits arm 1 twice (once per pick). Arm 2 never fires for Z4.
+    """
+    prof, refs = _build_chain_fixture()
+    Z1, Z2, Z3, Z4 = refs["Z1"], refs["Z2"], refs["Z3"], refs["Z4"]
+    metas = build_candidates(prof)
+    z2, z3, z4 = metas[Z2], metas[Z3], metas[Z4]
+
+    initial_z4_ratio = z4.recomp_ratio  # 100 / 8.0 = 12.5
+    assert initial_z4_ratio == 100 / 8.0
+
+    # Pick Z3.
+    candidates: Dict[fx.Node, ActivationMeta] = dict(metas)
+    candidates.pop(Z3)
+    recomps: Dict[fx.Node, ActivationMeta] = {}
+    update_existing_recomps(z3, recomps)
+    recomps[z3.node] = z3
+    update_remaining_candidates(z3, candidates)
+
+    assert z4.recomp_srcs == {Z2}
+    assert z4.recomp_time == 12.0
+    assert z4.recomp_ratio == 100 / 12.0
+    assert z4.recomp_ratio != initial_z4_ratio
+
+    # Pick Z2.
+    candidates.pop(Z2)
+    update_existing_recomps(z2, recomps)
+    recomps[z2.node] = z2
+    update_remaining_candidates(z2, candidates)
+
+    # Z4 hit arm 1 again (Z2 was now in Z4.srcs after first pick).
+    assert z4.recomp_srcs == {Z1}
+    assert z4.recomp_time == 14.0
+    assert z4.total_recomp_time == 14.0
+    assert z4.recomp_cnt == 1
+    final_z4_ratio = z4.recomp_ratio
+    assert final_z4_ratio == 100 / 14.0
+    assert final_z4_ratio != initial_z4_ratio
+    assert final_z4_ratio < initial_z4_ratio  # cost grew → ratio shrunk
+
+
 def test_simulate_swaps_unsupported_raises():
     prof, refs = _three_layer_mlp_prof()
     Z1 = refs["Z1"]
@@ -745,3 +887,246 @@ def test_simulate_resnet18_one_recompute_phase_b_delta():
 
     del exp, compiled_fn, prof, metas
     torch.cuda.empty_cache()
+
+
+# ---------------------------------------------------------------------------
+# Step 6: Algorithm F real-model gates on Resnet18.
+# ---------------------------------------------------------------------------
+
+
+def _profile_resnet18():
+    """Profile Resnet18 at batch_size=4. Skips if CUDA is unavailable.
+    Returns the populated GraphProfiler."""
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for real-model profiling")
+
+    from benchmarks import Experiment
+    from graph_tracer import compile
+
+    torch.cuda.empty_cache()
+    exp = Experiment("Resnet18", batch_size=4)
+    exp.init_opt_states()
+
+    captured = {}
+
+    def capture_then_passthrough(gm, args):
+        from graph_prof import GraphProfiler
+
+        prof = GraphProfiler(gm)
+        with torch.no_grad():
+            for _ in range(2):
+                prof.run(*args)
+            prof.reset_stats()
+            for _ in range(3):
+                prof.run(*args)
+            prof.aggregate_stats()
+        captured["prof"] = prof
+        return gm
+
+    compiled_fn = compile(exp.train_step, capture_then_passthrough)
+    compiled_fn(exp.model, exp.optimizer, exp.example_inputs)
+
+    prof = captured["prof"]
+    del exp, compiled_fn
+    torch.cuda.empty_cache()
+    return prof
+
+
+def test_update_remaining_candidates_resnet18_arm1_propagation():
+    """Real-model gate: arm 1 propagation must work correctly on a graph with
+    hundreds of nodes, not just the synthetic chain. Pick the largest
+    activation; for every downstream candidate (those with t.node ∈ c.srcs),
+    assert the post-F state matches the expected propagation exactly. Untouched
+    candidates must be byte-identical to their snapshots.
+    """
+    prof = _profile_resnet18()
+    metas = build_candidates(prof)
+    assert metas, "Resnet18 should produce at least one activation candidate"
+
+    t = max(metas.values(), key=lambda m: m.size)
+
+    # Identify expected affected sets up front (frozen against future mutation).
+    arm1_targets = {
+        c.node for c in metas.values() if c is not t and t.node in c.recomp_srcs
+    }
+    arm2_targets = {
+        c.node for c in metas.values() if c is not t and c.node in t.recomp_srcs
+    }
+    assert arm1_targets, (
+        "Expected at least one downstream candidate (Resnet18 should have many)"
+    )
+    # arm 1 ∩ arm 2 must be empty in a DAG.
+    assert not (arm1_targets & arm2_targets), "arm1/arm2 collision — graph has a cycle?"
+
+    # Snapshot pre-call state. Decomposed property assertions below derive
+    # expected post-F state from these snapshots (NOT by re-running the
+    # implementation's formula on the live mutated objects). This catches
+    # formula-level regressions (e.g., wrong subtraction direction) that a
+    # formula-mirroring expected calculation would silently agree with.
+    pre = {}
+    for c in metas.values():
+        pre[c.node] = (
+            frozenset(c.recomp_srcs),
+            c.recomp_time,
+            c.total_recomp_time,
+            c.recomp_cnt,
+        )
+    t_recomp_time_before = t.recomp_time
+    t_recomp_srcs_before = frozenset(t.recomp_srcs)
+
+    candidates = dict(metas)
+    candidates.pop(t.node)
+    update_remaining_candidates(t, candidates)
+
+    # t itself shouldn't have been mutated (not in candidates).
+    assert t.recomp_time == t_recomp_time_before
+    assert frozenset(t.recomp_srcs) == t_recomp_srcs_before
+
+    # For every arm-1 candidate, assert decomposed spec properties:
+    # (a) t.node was removed from c.recomp_srcs.
+    # (b) every node in t.recomp_srcs (pre-call) is now in c.recomp_srcs.
+    # (c) c.recomp_time grew by exactly t.recomp_time.
+    # (d) c.total_recomp_time = c.recomp_cnt × c.recomp_time (E-style invariant).
+    # (e) c.recomp_cnt is unchanged.
+    for node in arm1_targets:
+        c = metas[node]
+        c_srcs_pre, c_time_pre, _, c_cnt_pre = pre[node]
+
+        # (a) removal
+        assert t.node not in c.recomp_srcs, (
+            f"arm1 failed to remove t.node from {node.name}.recomp_srcs"
+        )
+        # (b) injection of t's sources
+        for src in t_recomp_srcs_before:
+            assert src in c.recomp_srcs, (
+                f"arm1 missed injecting {src.name} into {node.name}.recomp_srcs"
+            )
+        # Sanity: c's other pre-existing srcs are still there too.
+        for src in c_srcs_pre - {t.node}:
+            assert src in c.recomp_srcs, (
+                f"arm1 dropped pre-existing src {src.name} from {node.name}"
+            )
+        # (c) recomp_time grew by exactly t.recomp_time.
+        assert c.recomp_time == c_time_pre + t_recomp_time_before, (
+            f"arm1 recomp_time wrong on {node.name}: "
+            f"got {c.recomp_time}, expected {c_time_pre + t_recomp_time_before}"
+        )
+        # (d) total_recomp_time invariant.
+        assert c.total_recomp_time == c.recomp_cnt * c.recomp_time, (
+            f"arm1 broke cnt × time invariant on {node.name}"
+        )
+        # (e) cnt unchanged.
+        assert c.recomp_cnt == c_cnt_pre, (
+            f"arm1 must not bump recomp_cnt on {node.name}"
+        )
+
+    # Verify untouched candidates are byte-identical to snapshots.
+    untouched_count = 0
+    for c in metas.values():
+        if c is t or c.node in arm1_targets or c.node in arm2_targets:
+            continue
+        snap = pre[c.node]
+        assert frozenset(c.recomp_srcs) == snap[0], f"untouched {c.node.name} srcs changed"
+        assert c.recomp_time == snap[1], f"untouched {c.node.name} time changed"
+        assert c.total_recomp_time == snap[2], f"untouched {c.node.name} total changed"
+        assert c.recomp_cnt == snap[3], f"untouched {c.node.name} cnt changed"
+        untouched_count += 1
+
+    print(
+        f"\n[resnet18 F arm1] target={t.node.name} size={t.size} "
+        f"arm1_count={len(arm1_targets)} arm2_count={len(arm2_targets)} "
+        f"untouched={untouched_count}"
+    )
+
+
+def test_update_remaining_candidates_resnet18_cascade_arm2_multiplier():
+    """Real-model gate: the arm 2 multiplier must use the post-E t.recomp_cnt.
+
+    Pick t1 such that some other activation t2 ∈ t1.recomp_srcs (a chained
+    dependency in the candidate graph). Pick t2 next; Algorithm E will bump
+    t2.recomp_cnt to 2 (because t2 ∈ t1.recomp_srcs at E's call time —
+    F doesn't mutate prior recomps' srcs). Then F arm 2 should fire for any
+    remaining candidate d with d ∈ t2.recomp_srcs, setting:
+
+        d.total_recomp_time = t2.recomp_cnt × d.recomp_time = 2 × d.recomp_time
+    """
+    prof = _profile_resnet18()
+    metas = build_candidates(prof)
+
+    # Find (t1, t2) such that t2 is an activation in t1.recomp_srcs.
+    t1 = None
+    t2 = None
+    for cand in metas.values():
+        for src in cand.recomp_srcs:
+            if src in metas:
+                t1 = cand
+                t2 = metas[src]
+                break
+        if t1 is not None:
+            break
+
+    if t1 is None or t2 is None:
+        pytest.skip("No (t1, t2) chain found in Resnet18 candidate graph")
+
+    # Find a d such that:
+    #   (1) d ∈ t2.recomp_srcs (so arm 2 will fire when we pick t2),
+    #   (2) d is still in metas (a candidate, not a placeholder),
+    #   (3) d.recomp_time > 0 (otherwise the assertion 0 == 2×0 is trivially true
+    #       and a buggy arm-2 setting d.total = 0 would silently pass), and
+    #   (4) d.node ∉ t1.recomp_srcs (otherwise arm 1 would fire on d during the
+    #       t1-pick step, mutating d.recomp_time and invalidating the snapshot
+    #       that the arm-2 assertion compares against).
+    d_candidates = [
+        metas[s]
+        for s in t2.recomp_srcs
+        if s in metas
+        and metas[s].recomp_time > 0.0
+        and s not in t1.recomp_srcs
+    ]
+    if not d_candidates:
+        pytest.skip("No non-degenerate d ∈ t2.recomp_srcs found among Resnet18 candidates")
+    d = d_candidates[0]
+
+    # Snapshot d's pre-state.
+    d_recomp_time_before = d.recomp_time
+    d_recomp_cnt_before = d.recomp_cnt
+
+    candidates = dict(metas)
+    recomps: Dict[fx.Node, ActivationMeta] = {}
+
+    # Pick t1.
+    candidates.pop(t1.node)
+    update_existing_recomps(t1, recomps)
+    recomps[t1.node] = t1
+    update_remaining_candidates(t1, candidates)
+
+    assert t1.recomp_cnt == 1, "no prior recomps — t1.cnt should still be 1"
+    # t2 in candidates should still have recomp_cnt = 1 (E only bumps when picking).
+    assert t2.recomp_cnt == 1
+
+    # Pick t2 — this should bump t2.recomp_cnt to 2 because t2 ∈ t1.recomp_srcs.
+    # (F at step "pick t1" only mutates remaining candidates, not t1 itself.)
+    assert t2.node in t1.recomp_srcs, "t1.srcs was unexpectedly mutated by F"
+    candidates.pop(t2.node)
+    update_existing_recomps(t2, recomps)
+    assert t2.recomp_cnt == 2, f"E should bump t2.cnt to 2; got {t2.recomp_cnt}"
+    recomps[t2.node] = t2
+    update_remaining_candidates(t2, candidates)
+
+    # Arm 2 should have fired for d.
+    assert d.recomp_cnt == d_recomp_cnt_before, "arm 2 should not bump d.cnt"
+    assert d.recomp_time == d_recomp_time_before, "arm 2 should not change d.recomp_time"
+    assert d.total_recomp_time == 2 * d.recomp_time, (
+        f"arm 2 multiplier wrong on d={d.node.name}: "
+        f"got {d.total_recomp_time}, expected {2 * d.recomp_time} "
+        f"(2 × d.recomp_time={d.recomp_time})"
+    )
+    assert d.recomp_ratio == d.size / (2 * d.recomp_time)
+
+    print(
+        f"\n[resnet18 F arm2] t1={t1.node.name} t2={t2.node.name} d={d.node.name} "
+        f"d.recomp_time={d.recomp_time} d.total={d.total_recomp_time} "
+        f"(2× expected)"
+    )

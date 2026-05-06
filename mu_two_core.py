@@ -157,6 +157,53 @@ def update_existing_recomps(
 
 
 # ---------------------------------------------------------------------------
+# Algorithm F — propagate to remaining candidates when a new t is picked.
+# ---------------------------------------------------------------------------
+
+
+def update_remaining_candidates(
+    t: ActivationMeta,
+    candidates: Dict[fx.Node, ActivationMeta],
+) -> None:
+    """When `t` is freshly chosen, refresh remaining candidates' costs.
+
+    Two arms (mutually exclusive in a DAG; no candidate satisfies both at once):
+
+    Arm 1 — t was a source of c:
+      c must now reach further back to regenerate (t is no longer resident at
+      c's window). Propagate t's sources into c's, accumulate t's recomp_time,
+      and refresh total_recomp_time to keep the cnt × time invariant.
+
+    Arm 2 — c is a source of t:
+      If c is later picked, c will execute once per t-window. The cost estimate
+      reflects this directly: total_recomp_time = t.recomp_cnt × c.recomp_time.
+      Note this overrides total_recomp_time without bumping c.recomp_cnt — the
+      cnt belongs to c's own pick history, not t's. Same convention as the
+      paper and the reference impl; intentionally breaks the cnt × time
+      invariant for c.
+
+    Caller convention: invoke AFTER `update_existing_recomps(t, recomps)` and
+    AFTER removing t from `candidates`. By that point t.recomp_cnt has been
+    bumped by Algorithm E if t was a source of any prior recomp, so the
+    multiplier in arm 2 is the post-E value.
+    """
+    # Guard the most common caller-ordering bug: forgetting to remove t from
+    # candidates before this call. Without this, arm 2 would fire on t itself
+    # (since t.node ∈ t.recomp_srcs is false, but other consistency invariants
+    # would silently break).
+    assert t.node not in candidates, (
+        "t must be removed from candidates before update_remaining_candidates"
+    )
+    for c in candidates.values():
+        if t.node in c.recomp_srcs:
+            c.recomp_srcs = (c.recomp_srcs - {t.node}) | t.recomp_srcs
+            c.recomp_time += t.recomp_time
+            c.total_recomp_time = c.recomp_cnt * c.recomp_time
+        elif c.node in t.recomp_srcs:
+            c.total_recomp_time = t.recomp_cnt * c.recomp_time
+
+
+# ---------------------------------------------------------------------------
 # Memory simulator (Algorithm G)
 # ---------------------------------------------------------------------------
 
