@@ -8,7 +8,13 @@ import pytest
 import torch.fx as fx
 
 from graph_prof import OP
-from mu_two_core import ActivationMeta, Status, build_candidates, simulate
+from mu_two_core import (
+    ActivationMeta,
+    Status,
+    build_candidates,
+    simulate,
+    update_existing_recomps,
+)
 
 
 def _make_meta(**overrides):
@@ -164,26 +170,29 @@ def test_build_candidates_three_layer_mlp():
 
     assert set(metas.keys()) == {Z1, Z2, Z3}
 
+    # recomp_subgraph includes the activation itself as the final op — it must
+    # be re-executed to produce the output tensor (its runtime contributes to
+    # recomp_time, its size contributes to the simulator's window_extra).
     m1 = metas[Z1]
-    assert m1.recomp_subgraph == (matmul1,)
+    assert m1.recomp_subgraph == (matmul1, Z1)
     assert m1.recomp_srcs == {X, P1}
-    assert m1.recomp_time == 1.0
-    assert m1.total_recomp_time == 1.0
+    assert m1.recomp_time == 1.1   # matmul1 (1.0) + Z1 (0.1)
+    assert m1.total_recomp_time == 1.1
     assert m1.recomp_cnt == 1
     assert m1.size == 100
     assert m1.last_fwd_idx == nodes.index(matmul2)
     assert m1.first_bwd_idx == nodes.index(bwd1)
 
     m2 = metas[Z2]
-    assert m2.recomp_subgraph == (matmul2,)
+    assert m2.recomp_subgraph == (matmul2, Z2)
     assert m2.recomp_srcs == {Z1, P2}     # halts at the prior activation
-    assert m2.recomp_time == 2.0
+    assert m2.recomp_time == 2.1
 
     m3 = metas[Z3]
-    assert m3.recomp_subgraph == (matmul3,)
+    assert m3.recomp_subgraph == (matmul3, Z3)
     assert m3.recomp_srcs == {Z2, P3}
-    assert m3.recomp_time == 3.0
-    assert m3.recomp_ratio == 300 / 3.0
+    assert m3.recomp_time == 3.1
+    assert m3.recomp_ratio == 300 / 3.1
 
 
 def test_build_candidates_act_without_fwd_user_uses_own_idx():
@@ -347,6 +356,211 @@ def test_simulate_returns_per_node_timeline_length():
     assert len(out) == len(prof.node_order)
 
 
+# ---------------------------------------------------------------------------
+# Steps 4 + 5: simulator delta gate + Algorithm E (cascading recomputes).
+#
+# Shared chain fixture: activations Z1..Z4 separated by interior ops M1..M4 so
+# build_candidates sees a non-empty recomp_subgraph for each. Backward consumers
+# bwd_Zi run in reverse forward order so each Zi has a meaningful gap between
+# last_fwd and first_bwd.
+# ---------------------------------------------------------------------------
+
+
+def _build_chain_fixture():
+    """Chain X → M1 → Z1 → M2 → Z2 → M3 → Z3 → M4 → Z4 with bwd consumers.
+
+    Sizes are chosen so the simulator's recompute deltas are easy to read:
+      size(Zi) = 100, size(Mi) = 50, size(X) = 10.
+    Runtimes (Mi only — Zi runtime doesn't affect recomp_time since Zi itself
+    isn't in any recomp_subgraph):
+      M1=1.0, M2=2.0, M3=4.0, M4=8.0.
+    """
+    X = _FakeNode("X", OP.PLACEHOLDER)
+    M1 = _FakeNode("M1", OP.CALL_FUNCTION, [X])
+    Z1 = _FakeNode("Z1", OP.CALL_FUNCTION, [M1])
+    M2 = _FakeNode("M2", OP.CALL_FUNCTION, [Z1])
+    Z2 = _FakeNode("Z2", OP.CALL_FUNCTION, [M2])
+    M3 = _FakeNode("M3", OP.CALL_FUNCTION, [Z2])
+    Z3 = _FakeNode("Z3", OP.CALL_FUNCTION, [M3])
+    M4 = _FakeNode("M4", OP.CALL_FUNCTION, [Z3])
+    Z4 = _FakeNode("Z4", OP.CALL_FUNCTION, [M4])
+
+    bwd_Z4 = _FakeNode("bwd_Z4", OP.CALL_FUNCTION, [Z4])
+    bwd_Z3 = _FakeNode("bwd_Z3", OP.CALL_FUNCTION, [Z3])
+    bwd_Z2 = _FakeNode("bwd_Z2", OP.CALL_FUNCTION, [Z2])
+    bwd_Z1 = _FakeNode("bwd_Z1", OP.CALL_FUNCTION, [Z1])
+
+    nodes = [
+        X, M1, Z1, M2, Z2, M3, Z3, M4, Z4,
+        bwd_Z4, bwd_Z3, bwd_Z2, bwd_Z1,
+    ]
+    activations = {Z1, Z2, Z3, Z4}
+    regions = {
+        X: 0, M1: 0, Z1: 0, M2: 0, Z2: 0, M3: 0, Z3: 0, M4: 0, Z4: 0,
+        bwd_Z4: 2, bwd_Z3: 2, bwd_Z2: 2, bwd_Z1: 2,
+    }
+    runtimes = {M1: 1.0, M2: 2.0, M3: 4.0, M4: 8.0}
+    sizes = {
+        X: 10,
+        M1: 50, Z1: 100,
+        M2: 50, Z2: 100,
+        M3: 50, Z3: 100,
+        M4: 50, Z4: 100,
+        bwd_Z4: 0, bwd_Z3: 0, bwd_Z2: 0, bwd_Z1: 0,
+    }
+    last_fwd = {Z1: M2, Z2: M3, Z3: M4, Z4: Z4}
+    first_bwd = {Z1: bwd_Z1, Z2: bwd_Z2, Z3: bwd_Z3, Z4: bwd_Z4}
+
+    prof = _fake_prof(nodes, activations, regions, runtimes, sizes, last_fwd, first_bwd)
+    refs = dict(
+        nodes=nodes,
+        X=X,
+        M1=M1, M2=M2, M3=M3, M4=M4,
+        Z1=Z1, Z2=Z2, Z3=Z3, Z4=Z4,
+        bwd_Z1=bwd_Z1, bwd_Z2=bwd_Z2, bwd_Z3=bwd_Z3, bwd_Z4=bwd_Z4,
+    )
+    return prof, refs
+
+
+def test_simulate_one_recompute_delta_matches_phase_b():
+    """Pin down both Phase B mutations independently on the chain fixture.
+
+    With the chain X→M1→Z1→…→M4→Z4 and Z3 picked for recompute:
+      - last_fwd_idx(Z3) = order_index[M4] = 7
+      - first_bwd_idx(Z3) = order_index[bwd_Z3] = 10
+      - gap = (7, 10) = {8, 9}
+      - recomp_subgraph(Z3) = (M3, Z3) → window_extra = size(M3) + size(Z3) = 150
+
+    The simulator subtracts size(Z3)=100 in the gap (early-free at last_fwd_idx)
+    and adds window_extra=150 at the recompute insertion slot hi-1=9. So the
+    delta vs baseline is: -100 at idx 8 (pure-gap drop), and -100 + 150 = +50
+    at idx 9 (the recompute insertion: Z3 is freed early but the rewritten
+    backward immediately re-executes M3 + Z3 to produce the consumed tensor,
+    so both intermediate M3' and recomputed Z3' are alive there).
+
+    The +50 at idx 9 is the load-bearing assertion against anti-shortcut #3
+    (phase2-rebuild's central bug): if window_extra silently excludes the
+    re-executed activation itself, delta[9] becomes -50 instead of +50 and the
+    simulator under-predicts peak at exactly the slot where it must not.
+    """
+    prof, refs = _build_chain_fixture()
+    Z3 = refs["Z3"]
+    metas = build_candidates(prof)
+    z3_meta = metas[Z3]
+
+    assert z3_meta.last_fwd_idx == 7
+    assert z3_meta.first_bwd_idx == 10
+    assert z3_meta.recomp_subgraph == (refs["M3"], Z3)
+    assert z3_meta.size == 100
+
+    baseline = simulate(prof, recomps={})
+    with_rc = simulate(prof, recomps={Z3: z3_meta})
+    delta = [w - b for w, b in zip(with_rc, baseline)]
+
+    for i in [0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12]:
+        assert delta[i] == 0, f"unexpected delta at idx {i}: {delta[i]}"
+
+    assert delta[8] == -100, f"pure-gap drop wrong: {delta[8]}"
+    assert delta[9] == 50, f"insertion delta wrong: {delta[9]}"
+
+
+def test_algorithm_e_cascade_pick_z3_then_z2():
+    """Pick Z3, then Z2: Z2 propagates upstream into Z3's sources.
+
+    Initial state from build_candidates on the chain:
+      Z3.recomp_srcs = {Z2}, Z3.recomp_subgraph = (M3,), Z3.recomp_time = 4.0
+      Z2.recomp_srcs = {Z1}, Z2.recomp_subgraph = (M2,), Z2.recomp_time = 2.0
+
+    After picking Z3 (no prior recomps, so Algorithm E is a no-op):
+      Z3.recomp_cnt = 1, Z3.total_recomp_time = 4.0
+
+    After picking Z2 (Algorithm E vs prior {Z3}):
+      Z3 had Z2 in its sources, so:
+        Z3.recomp_srcs becomes ({Z2} \\ {Z2}) ∪ Z2.recomp_srcs = {Z1}
+        Z3.recomp_time absorbs Z2.recomp_time → 4.0 + 2.0 = 6.0
+        Z2.recomp_cnt bumps to 2 (Z2 will be re-executed once per Z3 run too)
+      Z3.total_recomp_time refreshes to 1 * 6.0 = 6.0
+      Z2.total_recomp_time is set by caller to 2 * 2.0 = 4.0
+
+    Note the gate in TENTATIVE_PLAN.md §6 says "assert Z3.recomp_cnt=2"; per
+    Algorithm E in §3 the bumped count belongs to t (the freshly picked
+    candidate, here Z2), not to the prior R (Z3). The assertion below reflects
+    that — flagged in the plan file.
+    """
+    prof, refs = _build_chain_fixture()
+    Z2, Z3 = refs["Z2"], refs["Z3"]
+    Z1, M2, M3 = refs["Z1"], refs["M2"], refs["M3"]
+    metas = build_candidates(prof)
+    z2, z3 = metas[Z2], metas[Z3]
+
+    assert z2.recomp_srcs == {Z1}
+    assert z3.recomp_srcs == {Z2}
+    assert z2.recomp_subgraph == (M2, Z2)
+    assert z3.recomp_subgraph == (M3, Z3)
+    # Zi runtimes default to 0.0 (not in `runtimes` dict), so recomp_time
+    # equals just the Mi runtime even though Zi is in the subgraph.
+    assert z2.recomp_time == 2.0
+    assert z3.recomp_time == 4.0
+
+    z2_recomp_time_initial = z2.recomp_time
+    z3_recomp_time_initial = z3.recomp_time
+
+    # Pick Z3 (no Algorithm E call — recomps was empty).
+    recomps: Dict[fx.Node, ActivationMeta] = {z3.node: z3}
+    assert z3.recomp_cnt == 1
+    assert z3.total_recomp_time == 4.0  # initialized by build_candidates
+
+    # Pick Z2: invoke Algorithm E against prior recomps, then insert.
+    # update_existing_recomps now self-refreshes t.total_recomp_time.
+    update_existing_recomps(z2, recomps)
+    recomps[z2.node] = z2
+
+    # Source propagation: Z2 left Z3's source set, Z1 took its place.
+    assert Z2 not in z3.recomp_srcs
+    assert z3.recomp_srcs == {Z1}, f"got {z3.recomp_srcs}"
+
+    # recomp_cnt bumped on t (= Z2), not on the prior R (= Z3).
+    assert z2.recomp_cnt == 2
+    assert z3.recomp_cnt == 1
+
+    # Z3 absorbed Z2's recompute time. Z2 itself is unchanged.
+    assert z3.recomp_time == z3_recomp_time_initial + z2_recomp_time_initial
+    assert z2.recomp_time == z2_recomp_time_initial
+
+    # total_recomp_time reflects updated cnt × time on both.
+    assert z3.total_recomp_time == 1 * 6.0
+    assert z2.total_recomp_time == 2 * 2.0
+
+    # recomp_subgraph deliberately not rebuilt (intentional approximation).
+    assert z3.recomp_subgraph == (M3, Z3)
+    assert z2.recomp_subgraph == (M2, Z2)
+
+
+def test_algorithm_e_no_op_when_t_not_a_source():
+    """If t.node is in no prior R's recomp_srcs, Algorithm E only refreshes
+    total_recomp_time on existing R's. recomp_cnt and recomp_srcs untouched."""
+    prof, refs = _build_chain_fixture()
+    Z3, Z4 = refs["Z3"], refs["Z4"]
+    metas = build_candidates(prof)
+    z3, z4 = metas[Z3], metas[Z4]
+
+    # Pre-set total_recomp_time on Z3 to a stale value to verify the refresh.
+    recomps: Dict[fx.Node, ActivationMeta] = {z3.node: z3}
+    z3.total_recomp_time = 999.0
+
+    # Z4 has no prior recomp pointing at it (Z3 doesn't list Z4 as a source).
+    update_existing_recomps(z4, recomps)
+
+    assert z3.recomp_cnt == 1
+    assert z3.recomp_srcs == {refs["Z2"]}
+    assert z3.recomp_time == 4.0
+    # Refreshed even though no propagation happened.
+    assert z3.total_recomp_time == 1 * 4.0
+    # t.total_recomp_time is also self-refreshed (1 × Z4.recomp_time = 8.0).
+    assert z4.recomp_cnt == 1
+    assert z4.total_recomp_time == 1 * 8.0
+
+
 def test_simulate_swaps_unsupported_raises():
     prof, refs = _three_layer_mlp_prof()
     Z1 = refs["Z1"]
@@ -424,4 +638,110 @@ def test_simulate_resnet18_baseline_matches_stacked_sum():
             )
 
     del exp, compiled_fn
+    torch.cuda.empty_cache()
+
+
+def test_simulate_resnet18_one_recompute_phase_b_delta():
+    """Real-model gate for Phase B: with a single chosen recompute, the
+    simulator's delta vs baseline must match the documented mutations on a
+    real graph (~hundreds of nodes), not just the synthetic chain.
+
+    Picks the largest activation candidate (strongest numeric signal) and
+    asserts:
+      - delta == 0 outside [last_fwd_idx + 1, first_bwd_idx).
+      - delta == -size at every pure-gap index (lo+1 ≤ i < hi-1).
+      - delta == window_extra - size at the recompute insertion slot (hi-1).
+      - delta[hi-1] >= 0 — the load-bearing assertion against anti-shortcut #3.
+        Because recomp_subgraph includes the activation itself, window_extra
+        >= size(act), so the insertion slot grows (or breaks even) relative
+        to baseline. If a future change excludes act from the subgraph,
+        delta[hi-1] would go negative and this test fails immediately.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for real-model profiling")
+
+    from benchmarks import Experiment
+    from graph_tracer import compile
+
+    torch.cuda.empty_cache()
+    exp = Experiment("Resnet18", batch_size=4)
+    exp.init_opt_states()
+
+    captured = {}
+
+    def capture_then_passthrough(gm, args):
+        warm_up_iters, profile_iters = 2, 3
+        from graph_prof import GraphProfiler
+
+        prof = GraphProfiler(gm)
+        with torch.no_grad():
+            for _ in range(warm_up_iters):
+                prof.run(*args)
+            prof.reset_stats()
+            for _ in range(profile_iters):
+                prof.run(*args)
+            prof.aggregate_stats()
+        captured["prof"] = prof
+        return gm
+
+    compiled_fn = compile(exp.train_step, capture_then_passthrough)
+    compiled_fn(exp.model, exp.optimizer, exp.example_inputs)
+
+    prof = captured["prof"]
+    metas = build_candidates(prof)
+    assert metas, "Resnet18 should produce at least one activation candidate"
+
+    target = max(metas.values(), key=lambda m: m.size)
+    assert target.size > 0
+    assert len(target.recomp_subgraph) >= 1, "subgraph must include at least act itself"
+    assert target.node in target.recomp_subgraph, "act itself must be in its subgraph"
+
+    baseline = simulate(prof, recomps={})
+    with_rc = simulate(prof, recomps={target.node: target})
+    delta = [w - b for w, b in zip(with_rc, baseline)]
+
+    lo, hi = target.last_fwd_idx, target.first_bwd_idx
+    assert hi > lo, f"degenerate gap (lo={lo}, hi={hi})"
+
+    window_extra = sum(
+        int(prof.avg_output_sizes.get(n, 0)) for n in target.recomp_subgraph
+    )
+
+    # Outside the affected range: zero delta.
+    for i, d in enumerate(delta):
+        if i <= lo or i >= hi:
+            assert d == 0, f"unexpected delta at idx {i}: {d}"
+
+    # Pure-gap indices (loop is empty if hi - lo <= 2).
+    for i in range(lo + 1, hi - 1):
+        assert delta[i] == -target.size, (
+            f"gap drop wrong at idx {i}: got {delta[i]}, expected {-target.size}"
+        )
+
+    # Recompute insertion slot.
+    expected_insertion_delta = window_extra - target.size
+    assert delta[hi - 1] == expected_insertion_delta, (
+        f"insertion delta wrong: got {delta[hi - 1]}, "
+        f"expected window_extra({window_extra}) - size({target.size}) "
+        f"= {expected_insertion_delta}"
+    )
+
+    # The smoking-gun assertion: act-itself is in window_extra, so the
+    # insertion slot doesn't dip below baseline.
+    assert delta[hi - 1] >= 0, (
+        f"delta[hi-1]={delta[hi-1]} < 0 — phase2-rebuild bug class. "
+        f"window_extra={window_extra}, target.size={target.size}, "
+        f"subgraph_size={len(target.recomp_subgraph)}"
+    )
+
+    print(
+        f"\n[resnet18 phase_b] target={target.node.name} size={target.size} "
+        f"subgraph_nodes={len(target.recomp_subgraph)} "
+        f"window_extra={window_extra} gap={hi - lo - 1} "
+        f"delta[hi-1]=+{delta[hi - 1]}"
+    )
+
+    del exp, compiled_fn, prof, metas
     torch.cuda.empty_cache()

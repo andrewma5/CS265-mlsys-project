@@ -71,9 +71,15 @@ def build_candidates(prof: GraphProfiler) -> Dict[fx.Node, ActivationMeta]:
 
         last_fwd_idx = prof.last_forward_use_idx(act)
 
+        # `act` itself is the final op of the recomputation: regenerating it
+        # requires re-executing every interior input AND running act's own op
+        # to produce the output tensor. So act is included in recomp_subgraph
+        # and contributes both its runtime (to recomp_time) and its output size
+        # (to the simulator's window_extra). Excluding it under-estimates both,
+        # which silently corrupts greedy ranking and peak prediction.
         visited: Set[fx.Node] = {act}
         stack = [act]
-        interior: list[fx.Node] = []
+        interior: list[fx.Node] = [act]
         srcs: Set[fx.Node] = set()
 
         while stack:
@@ -109,6 +115,45 @@ def build_candidates(prof: GraphProfiler) -> Dict[fx.Node, ActivationMeta]:
         )
 
     return metas
+
+
+# ---------------------------------------------------------------------------
+# Algorithm E — propagate sources into prior recomps when a new t is picked.
+# ---------------------------------------------------------------------------
+
+
+def update_existing_recomps(
+    t: ActivationMeta,
+    recomps: Dict[fx.Node, ActivationMeta],
+) -> None:
+    """When `t` is freshly chosen for recompute, update prior picks in-place.
+
+    For each prior recompute R whose source set contains t.node, t's own sources
+    flow upstream into R (R must now reach further back to regenerate itself,
+    since t is no longer memory-resident at R's recompute window). R also
+    absorbs t's recompute time, and t.recomp_cnt bumps because t will be
+    re-executed once per dependent R as well as for its own window.
+
+    Caller convention: this runs *before* recomps[t.node] = t. Algorithm F
+    (remaining-candidate update) is a separate function, not invoked here.
+    `t.total_recomp_time` is also refreshed by this function so the caller
+    doesn't have to remember.
+
+    Note (intentional approximation, per TENTATIVE_PLAN §3): we mutate the
+    scalar recomp_time and the recomp_srcs set, but we do not rebuild
+    recomp_subgraph. The simulator's window_extra estimate uses recomp_subgraph
+    and will undercount intermediate liveness for cascaded picks. Materializing
+    the full transitive subgraph is deferred to the rewriter (which runs once
+    after all picks are made).
+    """
+    for R in recomps.values():
+        if t.node in R.recomp_srcs:
+            R.recomp_srcs = (R.recomp_srcs - {t.node}) | t.recomp_srcs
+            R.recomp_time += t.recomp_time
+            t.recomp_cnt += 1
+    for R in recomps.values():
+        R.total_recomp_time = R.recomp_cnt * R.recomp_time
+    t.total_recomp_time = t.recomp_cnt * t.recomp_time
 
 
 # ---------------------------------------------------------------------------
