@@ -367,14 +367,18 @@ def test_simulate_returns_per_node_timeline_length():
 # ---------------------------------------------------------------------------
 
 
-def _build_chain_fixture():
+def _build_chain_fixture(runtimes_override=None):
     """Chain X → M1 → Z1 → M2 → Z2 → M3 → Z3 → M4 → Z4 with bwd consumers.
 
     Sizes are chosen so the simulator's recompute deltas are easy to read:
       size(Zi) = 100, size(Mi) = 50, size(X) = 10.
-    Runtimes (Mi only — Zi runtime doesn't affect recomp_time since Zi itself
-    isn't in any recomp_subgraph):
+    Runtimes (Mi only — Zi runtime defaults to 0 since not in the dict):
       M1=1.0, M2=2.0, M3=4.0, M4=8.0.
+
+    runtimes_override: optional dict {node_name: runtime_ms} to override the
+        default Mi runtimes. Used by Step 7's argmax test to skew ratios so
+        the highest-ratio activation is NOT first in iteration order — that
+        distinguishes correct argmax behavior from a "pick first" shortcut.
     """
     X = _FakeNode("X", OP.PLACEHOLDER)
     M1 = _FakeNode("M1", OP.CALL_FUNCTION, [X])
@@ -401,6 +405,10 @@ def _build_chain_fixture():
         bwd_Z4: 2, bwd_Z3: 2, bwd_Z2: 2, bwd_Z1: 2,
     }
     runtimes = {M1: 1.0, M2: 2.0, M3: 4.0, M4: 8.0}
+    if runtimes_override:
+        name_to_node = {n.name: n for n in nodes}
+        for name, rt in runtimes_override.items():
+            runtimes[name_to_node[name]] = rt
     sizes = {
         X: 10,
         M1: 50, Z1: 100,
@@ -1055,39 +1063,36 @@ def test_update_remaining_candidates_resnet18_cascade_arm2_multiplier():
     prof = _profile_resnet18()
     metas = build_candidates(prof)
 
-    # Find (t1, t2) such that t2 is an activation in t1.recomp_srcs.
-    t1 = None
-    t2 = None
-    for cand in metas.values():
-        for src in cand.recomp_srcs:
-            if src in metas:
-                t1 = cand
-                t2 = metas[src]
+    # Search exhaustively for a valid (t1, t2, d) triple satisfying:
+    #   - t2 ∈ t1.recomp_srcs (so E bumps t2.recomp_cnt to 2 when t2 is picked
+    #     after t1)
+    #   - d ∈ t2.recomp_srcs (so arm 2 fires when t2 is picked)
+    #   - d is a candidate (not a placeholder)
+    #   - d.recomp_time > 0 (otherwise 0 == 2×0 is trivially true and a buggy
+    #     arm-2 setting d.total = 0 would silently pass)
+    #   - d.node ∉ t1.recomp_srcs (otherwise arm 1 fires on d during t1's pick
+    #     step, mutating d.recomp_time and invalidating the snapshot)
+    t1 = t2 = d = None
+    for cand_t1 in metas.values():
+        for src1 in cand_t1.recomp_srcs:
+            if src1 not in metas:
+                continue
+            cand_t2 = metas[src1]
+            for src2 in cand_t2.recomp_srcs:
+                if (
+                    src2 in metas
+                    and metas[src2].recomp_time > 0.0
+                    and src2 not in cand_t1.recomp_srcs
+                ):
+                    t1, t2, d = cand_t1, cand_t2, metas[src2]
+                    break
+            if d is not None:
                 break
-        if t1 is not None:
+        if d is not None:
             break
 
-    if t1 is None or t2 is None:
-        pytest.skip("No (t1, t2) chain found in Resnet18 candidate graph")
-
-    # Find a d such that:
-    #   (1) d ∈ t2.recomp_srcs (so arm 2 will fire when we pick t2),
-    #   (2) d is still in metas (a candidate, not a placeholder),
-    #   (3) d.recomp_time > 0 (otherwise the assertion 0 == 2×0 is trivially true
-    #       and a buggy arm-2 setting d.total = 0 would silently pass), and
-    #   (4) d.node ∉ t1.recomp_srcs (otherwise arm 1 would fire on d during the
-    #       t1-pick step, mutating d.recomp_time and invalidating the snapshot
-    #       that the arm-2 assertion compares against).
-    d_candidates = [
-        metas[s]
-        for s in t2.recomp_srcs
-        if s in metas
-        and metas[s].recomp_time > 0.0
-        and s not in t1.recomp_srcs
-    ]
-    if not d_candidates:
-        pytest.skip("No non-degenerate d ∈ t2.recomp_srcs found among Resnet18 candidates")
-    d = d_candidates[0]
+    if d is None:
+        pytest.skip("No non-degenerate (t1, t2, d) triple in Resnet18 candidates")
 
     # Snapshot d's pre-state.
     d_recomp_time_before = d.recomp_time
@@ -1129,4 +1134,132 @@ def test_update_remaining_candidates_resnet18_cascade_arm2_multiplier():
         f"\n[resnet18 F arm2] t1={t1.node.name} t2={t2.node.name} d={d.node.name} "
         f"d.recomp_time={d.recomp_time} d.total={d.total_recomp_time} "
         f"(2× expected)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 7: greedy_recompute (mu_two_scheduler).
+# ---------------------------------------------------------------------------
+
+
+def test_greedy_already_met_budget_no_picks():
+    """If baseline peak already ≤ budget, the loop never enters and recomps
+    is empty. reached_budget == True."""
+    from mu_two_scheduler import greedy_recompute
+
+    prof, _ = _build_chain_fixture()
+    baseline_peak = max(simulate(prof, recomps={}))
+    assert baseline_peak == 450  # X dies fast, but Z1..Z4 live long → peak at Z4
+
+    recomps, reached = greedy_recompute(prof, budget=baseline_peak)
+    assert recomps == {}
+    assert reached is True
+
+
+def test_greedy_picks_highest_ratio_first_not_iteration_order():
+    """Argmax-vs-iteration-order test: with runtimes overridden so Z3 has the
+    highest ratio (despite being 3rd in topological order), greedy MUST pick
+    Z3 first. A bug like `pick = next(iter(candidates))` would pick Z1 (1st in
+    iter order) and fail this test.
+
+    Override:  M1=100, M2=50, M3=1, M4=200 → Zi.recomp_time = Mi.runtime
+        Z1.ratio = 100/100 = 1.0
+        Z2.ratio = 100/50  = 2.0
+        Z3.ratio = 100/1   = 100.0  ← highest, but mid-order
+        Z4.ratio = 100/200 = 0.5
+
+    With budget=0 (infeasible) the loop picks every candidate until exhausted,
+    but the first pick must still be argmax(ratio) = Z3.
+    """
+    from mu_two_scheduler import greedy_recompute
+
+    prof, refs = _build_chain_fixture(
+        runtimes_override={"M1": 100.0, "M2": 50.0, "M3": 1.0, "M4": 200.0}
+    )
+
+    # Verify the fixture's ratios pre-call.
+    metas_check = build_candidates(prof)
+    z1, z2, z3, z4 = (metas_check[refs[k]] for k in ("Z1", "Z2", "Z3", "Z4"))
+    assert z3.recomp_ratio == 100.0
+    assert z3.recomp_ratio > z1.recomp_ratio
+    assert z3.recomp_ratio > z2.recomp_ratio
+    assert z3.recomp_ratio > z4.recomp_ratio
+    # Sanity: build_candidates iterates in topological order (Z1, Z2, Z3, Z4),
+    # so Z1 is first. Z3 (the highest-ratio candidate) is mid-iteration —
+    # this is what makes the argmax-vs-iteration-order distinction meaningful.
+    assert next(iter(metas_check.keys())) is refs["Z1"]
+
+    recomps, _ = greedy_recompute(prof, budget=0)
+
+    # The first picked node must be Z3 (highest ratio), NOT Z1 (first in order).
+    first_pick = next(iter(recomps.keys()))
+    assert first_pick is refs["Z3"], (
+        f"First pick should be Z3 (highest ratio), got {first_pick.name}. "
+        "Likely cause: scheduler picks by iteration order instead of argmax."
+    )
+
+
+def test_greedy_cascading_picks_meets_budget():
+    """Default chain fixture, baseline_peak=450. With budget=300, the loop
+    needs multiple picks: Z1 (ratio 100) drops peak to 350, then Z2 (next
+    argmax after F mutates Z2) drops it to 250 ≤ 300. Loop exits."""
+    from mu_two_scheduler import greedy_recompute
+
+    prof, refs = _build_chain_fixture()
+    baseline_peak = max(simulate(prof, recomps={}))
+    assert baseline_peak == 450
+
+    budget = 300
+    recomps, reached = greedy_recompute(prof, budget=budget)
+
+    assert reached is True
+    final_peak = max(simulate(prof, recomps))
+    assert final_peak <= budget
+
+    # By ratio order: Z1 first (ratio=100), then whichever has next-highest.
+    pick_order = list(recomps.keys())
+    assert pick_order[0] is refs["Z1"], f"Expected Z1 first, got {pick_order[0].name}"
+    assert refs["Z2"] in recomps  # second pick to actually drop peak below 300
+
+
+def test_greedy_infeasible_budget_returns_false_no_exception():
+    """budget=0 is unreachable — params/ops always have nonzero peak. Loop
+    must exhaust candidates and return reached_budget=False without raising."""
+    from mu_two_scheduler import greedy_recompute
+
+    prof, _ = _build_chain_fixture()
+    recomps, reached = greedy_recompute(prof, budget=0)
+
+    assert reached is False
+    # All 4 activations should have been picked (loop runs until candidates empty).
+    assert len(recomps) == 4
+
+
+def test_greedy_recompute_resnet18_smoke():
+    """Real-model end-to-end smoke: greedy_recompute on Resnet18 doesn't crash,
+    returns valid types, and if it claims reached_budget then final peak is
+    actually ≤ budget."""
+    from mu_two_scheduler import greedy_recompute
+
+    prof = _profile_resnet18()
+    baseline_peak = max(simulate(prof, recomps={}))
+
+    # Moderately tight budget at 80% of baseline.
+    budget = int(baseline_peak * 0.8)
+
+    recomps, reached = greedy_recompute(prof, budget=budget)
+    final_peak = max(simulate(prof, recomps))
+
+    assert isinstance(recomps, dict)
+    assert isinstance(reached, bool)
+
+    if reached:
+        assert final_peak <= budget, (
+            f"reached_budget=True but final_peak={final_peak} > budget={budget}"
+        )
+
+    print(
+        f"\n[resnet18 greedy] baseline={baseline_peak / 1e6:.1f}MB "
+        f"budget={budget / 1e6:.1f}MB final={final_peak / 1e6:.1f}MB "
+        f"reached={reached} picks={len(recomps)}/{len(build_candidates(prof))}"
     )

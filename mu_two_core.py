@@ -62,7 +62,11 @@ def build_candidates(prof: GraphProfiler) -> Dict[fx.Node, ActivationMeta]:
     """
     metas: Dict[fx.Node, ActivationMeta] = {}
 
-    for act in prof.activation_nodes:
+    # Iterate activations in topological order so the resulting dict has a
+    # deterministic insertion order across runs (sets don't preserve it).
+    # The greedy scheduler's argmax doesn't care, but downstream consumers
+    # and tests do.
+    for act in sorted(prof.activation_nodes, key=lambda n: prof.order_index[n]):
         # Defensive check. The GraphProfiler classifier requires a bwd user, so this
         # should always be present for any node in activation_nodes.
         first_bwd = prof.first_backward_access.get(act)
@@ -148,10 +152,10 @@ def update_existing_recomps(
     """
     for R in recomps.values():
         if t.node in R.recomp_srcs:
-            R.recomp_srcs = (R.recomp_srcs - {t.node}) | t.recomp_srcs
+            R.recomp_srcs.discard(t.node)
+            R.recomp_srcs.update(t.recomp_srcs)
             R.recomp_time += t.recomp_time
             t.recomp_cnt += 1
-    for R in recomps.values():
         R.total_recomp_time = R.recomp_cnt * R.recomp_time
     t.total_recomp_time = t.recomp_cnt * t.recomp_time
 
@@ -196,7 +200,8 @@ def update_remaining_candidates(
     )
     for c in candidates.values():
         if t.node in c.recomp_srcs:
-            c.recomp_srcs = (c.recomp_srcs - {t.node}) | t.recomp_srcs
+            c.recomp_srcs.discard(t.node)
+            c.recomp_srcs.update(t.recomp_srcs)
             c.recomp_time += t.recomp_time
             c.total_recomp_time = c.recomp_cnt * c.recomp_time
         elif c.node in t.recomp_srcs:
