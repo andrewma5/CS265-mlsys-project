@@ -243,7 +243,7 @@ def _compile(func: Callable, *args: Any, **kwargs: Any):
     args = pytree.tree_map_only(torch.Tensor, _get_fake_args, args)
     kwargs = pytree.tree_map_only(torch.Tensor, _get_fake_args, kwargs)
 
-    with _enable_compile(), torch.autograd.detect_anomaly(check_nan=False):
+    with _enable_compile():
         gm = make_fx(
             partial(stateless_func, func),
             tracing_mode=tracing_mode,
