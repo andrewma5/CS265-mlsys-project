@@ -73,6 +73,13 @@ def build_candidates(prof: GraphProfiler) -> Dict[fx.Node, ActivationMeta]:
         if first_bwd is None:
             continue
 
+        # Skip leaf-tensor activations (no input tensor deps — e.g. aten.arange
+        # with all-scalar args, or aten.zeros). recomp_srcs would end up empty,
+        # the rewriter has nothing to bind a clone to, and these are tiny
+        # constants (~KB) so the savings aren't worth the special case.
+        if not act.all_input_nodes:
+            continue
+
         last_fwd_idx = prof.last_forward_use_idx(act)
 
         # `act` itself is the final op of the recomputation: regenerating it
