@@ -62,9 +62,7 @@ def build_candidates(prof: GraphProfiler) -> Dict[fx.Node, ActivationMeta]:
     metas: Dict[fx.Node, ActivationMeta] = {}
 
     # Iterate activations in topological order so the resulting dict has a
-    # deterministic insertion order across runs (sets don't preserve it).
-    # The greedy scheduler's argmax doesn't care, but downstream consumers
-    # and tests do.
+    # deterministic insertion order across runs.
     for act in sorted(prof.activation_nodes, key=lambda n: prof.order_index[n]):
         # Defensive check. The GraphProfiler classifier requires a bwd user, so this
         # should always be present for any node in activation_nodes.
@@ -127,17 +125,55 @@ def build_candidates(prof: GraphProfiler) -> Dict[fx.Node, ActivationMeta]:
     return metas
 
 
-def _absorb_pick_into(meta: ActivationMeta, t: ActivationMeta) -> None:
+def _merge_subgraphs(
+    a: Tuple[fx.Node, ...],
+    b: Tuple[fx.Node, ...],
+    order_index: Dict[fx.Node, int],
+) -> Tuple[fx.Node, ...]:
+    """Union of two subgraph tuples, deduped, sorted by program order.
+
+    Both inputs are already sorted by `order_index`; the union may not be when
+    `b` interleaves with `a`, so we re-sort. The simulator only sums sizes over
+    the result, but determinism still matters for tests and log output.
+    """
+    seen: Set[fx.Node] = set()
+    merged: List[fx.Node] = []
+    for n in a:
+        if n not in seen:
+            seen.add(n)
+            merged.append(n)
+    for n in b:
+        if n not in seen:
+            seen.add(n)
+            merged.append(n)
+    merged.sort(key=lambda n: order_index[n])
+    return tuple(merged)
+
+
+def _absorb_pick_into(
+    meta: ActivationMeta, t: ActivationMeta, prof: GraphProfiler
+) -> None:
     """Replace t in meta.recomp_srcs with t's own sources, accumulate t's
-    recomp_time, and refresh total under the cnt × time invariant.
+    recomp_time and interior subgraph, and refresh total under the cnt × time
+    invariant.
 
     Shared by Algorithm E (meta is a prior recompute) and Algorithm F arm 1
     (meta is a remaining candidate). Caller checks `t.node in meta.recomp_srcs`
     and bumps any cnt fields itself.
+
+    Paper note: paper Algorithms E/F mutate only `recomp_srcs` and `recomp_time`
+    (the paper has no `recomp_subgraph` field). Our `recomp_subgraph` is a
+    private field consumed only by our (more-conservative-than-paper) simulator;
+    we merge it transitively here so the simulator's whole-window estimate stays
+    a valid upper bound under cascading picks. The rewriter never trusts this
+    field — it re-extracts from the live FX graph in mu_two_rewrite.
     """
     meta.recomp_srcs.discard(t.node)
     meta.recomp_srcs.update(t.recomp_srcs)
     meta.recomp_time += t.recomp_time
+    meta.recomp_subgraph = _merge_subgraphs(
+        meta.recomp_subgraph, t.recomp_subgraph, prof.order_index
+    )
     meta.total_recomp_time = meta.recomp_cnt * meta.recomp_time
 
 
@@ -149,30 +185,25 @@ def _absorb_pick_into(meta: ActivationMeta, t: ActivationMeta) -> None:
 def update_existing_recomps(
     t: ActivationMeta,
     recomps: Dict[fx.Node, ActivationMeta],
+    prof: GraphProfiler,
 ) -> None:
     """When `t` is freshly chosen for recompute, update prior picks in-place.
 
     For each prior recompute R whose source set contains t.node, t's own sources
     flow upstream into R (R must now reach further back to regenerate itself,
     since t is no longer memory-resident at R's recompute window). R also
-    absorbs t's recompute time, and t.recomp_cnt bumps because t will be
-    re-executed once per dependent R as well as for its own window.
+    absorbs t's recompute time and t's interior subgraph (since regenerating R
+    now requires re-executing t's body too), and t.recomp_cnt bumps because t
+    will be re-executed once per dependent R as well as for its own window.
 
     Caller convention: this runs *before* recomps[t.node] = t. Algorithm F
     (remaining-candidate update) is a separate function, not invoked here.
     `t.total_recomp_time` is also refreshed by this function so the caller
     doesn't have to remember.
-
-    Note (intentional approximation, per TENTATIVE_PLAN §3): we mutate the
-    scalar recomp_time and the recomp_srcs set, but we do not rebuild
-    recomp_subgraph. The simulator's window_extra estimate uses recomp_subgraph
-    and will undercount intermediate liveness for cascaded picks. Materializing
-    the full transitive subgraph is deferred to the rewriter (which runs once
-    after all picks are made).
     """
     for R in recomps.values():
         if t.node in R.recomp_srcs:
-            _absorb_pick_into(R, t)
+            _absorb_pick_into(R, t, prof)
             t.recomp_cnt += 1
         R.total_recomp_time = R.recomp_cnt * R.recomp_time
     t.total_recomp_time = t.recomp_cnt * t.recomp_time
@@ -186,6 +217,7 @@ def update_existing_recomps(
 def update_remaining_candidates(
     t: ActivationMeta,
     candidates: Dict[fx.Node, ActivationMeta],
+    prof: GraphProfiler,
 ) -> None:
     """When `t` is freshly chosen, refresh remaining candidates' costs.
 
@@ -193,8 +225,8 @@ def update_remaining_candidates(
 
     Arm 1 — t was a source of c:
       c must now reach further back to regenerate (t is no longer resident at
-      c's window). Propagate t's sources into c's, accumulate t's recomp_time,
-      and refresh total_recomp_time to keep the cnt × time invariant.
+      c's window). Propagate t's sources, recomp_time, and interior subgraph
+      from t into c, and refresh total_recomp_time.
 
     Arm 2 — c is a source of t:
       If c is later picked, c will execute once per t-window. The cost estimate
@@ -204,14 +236,14 @@ def update_remaining_candidates(
       paper and the reference impl; intentionally breaks the cnt × time
       invariant for c.
 
-    Caller convention: invoke AFTER `update_existing_recomps(t, recomps)` and
-    AFTER removing t from `candidates`. By that point t.recomp_cnt has been
+    Caller convention: invoke AFTER `update_existing_recomps(t, recomps, prof)`
+    and AFTER removing t from `candidates`. By that point t.recomp_cnt has been
     bumped by Algorithm E if t was a source of any prior recomp, so the
     multiplier in arm 2 is the post-E value.
     """
     for c in candidates.values():
         if t.node in c.recomp_srcs:
-            _absorb_pick_into(c, t)
+            _absorb_pick_into(c, t, prof)
         elif c.node in t.recomp_srcs:
             c.total_recomp_time = t.recomp_cnt * c.recomp_time
 
@@ -259,6 +291,10 @@ def simulate(
     output sizes against the slot just before first_bwd_idx. This over-estimates
     intermediate liveness inside the window — acceptable because it never
     under-estimates the post-rewrite peak (anti-shortcut #3 in TENTATIVE_PLAN).
+    Cascaded picks preserve this property: Algorithms E/F merge the picked
+    candidate's interior subgraph into every dependent recomp, so window_extra
+    reflects the full transitive re-execution rather than just the build-time
+    interior.
     """
     n = len(prof.node_order)
     alive: List[int] = [0] * n

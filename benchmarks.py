@@ -17,7 +17,6 @@ from torchvision.models import resnet18, resnet50, resnet152
 from graph_prof import GraphProfiler, NodeType
 from graph_tracer import SEPFunction, compile
 
-
 model_names: List[str] = [
     "Transformer",
     "Resnet18",
@@ -171,7 +170,6 @@ class Experiment:
             from mu_two_scheduler import greedy_recompute
             from mu_two_rewrite import rewrite_recomputes
 
-            # Snapshot BEFORE rewriting — rewriter mutates user lists.
             self.baseline_breakdown_bytes = (
                 self.graph_profiler._compute_peak_breakdown()
             )
@@ -184,13 +182,12 @@ class Experiment:
                 budget = int(baseline_peak * self.mu_two_budget_fraction)
 
             recomps, reached = greedy_recompute(
-                self.graph_profiler, budget=budget,
+                self.graph_profiler,
+                budget=budget,
             )
             self.recomp_picks = recomps
             self.reached_budget = reached
-            self.predicted_peak_bytes = int(
-                max(simulate(self.graph_profiler, recomps))
-            )
+            self.predicted_peak_bytes = int(max(simulate(self.graph_profiler, recomps)))
 
             gm = rewrite_recomputes(gm, self.graph_profiler, recomps)
 
@@ -212,9 +209,7 @@ class Experiment:
             self.measured_peak_bytes = int(max(prof_after.avg_cumulative_mem))
 
             if not self.quiet_baseline_plots:
-                prof_after.plot_memory_timeline(
-                    f"{out_dir}/memory_timeline_mu_two.png"
-                )
+                prof_after.plot_memory_timeline(f"{out_dir}/memory_timeline_mu_two.png")
                 prof_after.plot_memory_breakdown(
                     f"{out_dir}/memory_breakdown_mu_two.png"
                 )
@@ -367,8 +362,20 @@ def _plot_memory_timeline_overlay(
     x_after = np.linspace(0, 1, len(after))
 
     fig, ax = plt.subplots(figsize=(12, 5))
-    ax.plot(x_base, base, color="steelblue", linewidth=1.2, label=f"Baseline (peak {max(base):.1f} MB)")
-    ax.plot(x_after, after, color="darkorange", linewidth=1.2, label=f"μ-TWO (peak {max(after):.1f} MB)")
+    ax.plot(
+        x_base,
+        base,
+        color="steelblue",
+        linewidth=1.2,
+        label=f"Baseline (peak {max(base):.1f} MB)",
+    )
+    ax.plot(
+        x_after,
+        after,
+        color="darkorange",
+        linewidth=1.2,
+        label=f"μ-TWO (peak {max(after):.1f} MB)",
+    )
     ax.fill_between(x_base, base, alpha=0.15, color="steelblue")
     ax.fill_between(x_after, after, alpha=0.15, color="darkorange")
 
@@ -495,12 +502,22 @@ def _plot_grouped_stacked_bars(
         base_seg = np.array([bd.get(nt, 0.0) for bd in baseline_breakdowns])
         mu_seg = np.array([bd.get(nt, 0.0) for bd in mu_two_breakdowns])
         ax.bar(
-            x - width / 2, base_seg, width, bottom=base_bottom,
-            color=colors[nt], edgecolor="black", linewidth=0.4,
+            x - width / 2,
+            base_seg,
+            width,
+            bottom=base_bottom,
+            color=colors[nt],
+            edgecolor="black",
+            linewidth=0.4,
         )
         rects_m = ax.bar(
-            x + width / 2, mu_seg, width, bottom=mu_bottom,
-            color=colors[nt], edgecolor="black", linewidth=0.4,
+            x + width / 2,
+            mu_seg,
+            width,
+            bottom=mu_bottom,
+            color=colors[nt],
+            edgecolor="black",
+            linewidth=0.4,
         )
         handles[nt] = rects_m
         base_bottom += base_seg
@@ -513,15 +530,29 @@ def _plot_grouped_stacked_bars(
                 handles[nt][i].set_hatch("//")
 
     # Label each bar with its total
-    ymax = max(base_bottom.max() if len(base_bottom) else 0,
-               mu_bottom.max() if len(mu_bottom) else 0,
-               1.0)
+    ymax = max(
+        base_bottom.max() if len(base_bottom) else 0,
+        mu_bottom.max() if len(mu_bottom) else 0,
+        1.0,
+    )
     for xi, total in zip(x - width / 2, base_bottom):
-        ax.text(xi, total + ymax * 0.01, f"{total:.0f}",
-                ha="center", va="bottom", fontsize=8)
+        ax.text(
+            xi,
+            total + ymax * 0.01,
+            f"{total:.0f}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
     for xi, total in zip(x + width / 2, mu_bottom):
-        ax.text(xi, total + ymax * 0.01, f"{total:.0f}",
-                ha="center", va="bottom", fontsize=8)
+        ax.text(
+            xi,
+            total + ymax * 0.01,
+            f"{total:.0f}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
 
     # x-axis: batch sizes with "B" / "μ" sub-labels handled by group spacing
     ax.set_xticks(x)
@@ -531,8 +562,13 @@ def _plot_grouped_stacked_bars(
     ax.set_title(title)
 
     # Legend: one swatch per NodeType, ACT first so it's prominent
-    legend_order = [NodeType.ACT, NodeType.OPT_STATE, NodeType.GRAD,
-                    NodeType.PARAM, NodeType.OTHER]
+    legend_order = [
+        NodeType.ACT,
+        NodeType.OPT_STATE,
+        NodeType.GRAD,
+        NodeType.PARAM,
+        NodeType.OTHER,
+    ]
     legend_handles = [
         plt.Rectangle((0, 0), 1, 1, color=colors[nt], ec="black", lw=0.4)
         for nt in legend_order

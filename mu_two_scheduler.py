@@ -41,11 +41,11 @@ def greedy_recompute(
         reached_budget: bool — True iff the final simulated peak ≤ budget.
 
     Call-order contract (load-bearing — see mu_two_core docstrings):
-      1. update_existing_recomps(t, recomps)   # E bumps t.recomp_cnt
-      2. recomps[t.node] = t                    # then insert t into recomps
-      3. del candidates[t.node]                 # remove t from candidates
-      4. update_remaining_candidates(t, ...)    # F uses post-E t.recomp_cnt
-      5. simulate(...)                           # re-derive peak + peak_idx
+      1. update_existing_recomps(t, recomps, prof)   # E bumps t.recomp_cnt
+      2. recomps[t.node] = t                          # then insert t into recomps
+      3. del candidates[t.node]                       # remove t from candidates
+      4. update_remaining_candidates(t, ..., prof)    # F uses post-E t.recomp_cnt
+      5. simulate(...)                                # re-derive peak + peak_idx
 
     The peak-aware gate replaces the prior "exhaust all candidates on
     infeasibility" behavior: small-bs runs (param/optimizer floor dominates)
@@ -68,11 +68,11 @@ def greedy_recompute(
             break
         t = max(eligible, key=lambda c: c.recomp_ratio)
 
-        update_existing_recomps(t, recomps)
+        update_existing_recomps(t, recomps, prof)
         recomps[t.node] = t
         t.status = Status.RECOMPUTE
         del candidates[t.node]
-        update_remaining_candidates(t, candidates)
+        update_remaining_candidates(t, candidates, prof)
 
         alive = simulate(prof, recomps)
         peak = max(alive)

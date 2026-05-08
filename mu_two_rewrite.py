@@ -60,20 +60,17 @@ def rewrite_recomputes(
     for meta in ordered:
         act = meta.node
         first_bwd = prof.first_backward_access.get(act)
+
         if first_bwd is None:
-            # build_candidates only keeps activations with a bwd user, so any
-            # meta in recomps must have one. Bail loudly if violated.
             raise RuntimeError(
                 f"recomp pick {act.name} has no first_backward_access entry"
             )
         if not meta.recomp_srcs:
-            # An activation whose entire recompute chain reduces to nothing
-            # has no source to bind the clone to. Should not happen for any
-            # real fwd activation (which traces back to placeholders).
             raise RuntimeError(
                 f"recomp pick {act.name} has empty recomp_srcs after cascade"
             )
 
+        # Extract subgraph from srcs -> act
         sub = _extract_graph_with_inputs_outputs(
             joint_graph=gm.graph,
             inputs=list(meta.recomp_srcs),
