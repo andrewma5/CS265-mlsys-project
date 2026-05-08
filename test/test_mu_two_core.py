@@ -76,9 +76,7 @@ def test_recomp_srcs_default_is_per_instance():
 
 def test_status_enum_members():
     assert Status.RETAINED is not Status.RECOMPUTE
-    assert Status.RECOMPUTE is not Status.SWAP
-    assert Status.RETAINED is not Status.SWAP
-    assert {s for s in Status} == {Status.RETAINED, Status.RECOMPUTE, Status.SWAP}
+    assert {s for s in Status} == {Status.RETAINED, Status.RECOMPUTE}
 
 
 # ---------------------------------------------------------------------------
@@ -709,14 +707,6 @@ def test_algorithm_f_pick_z3_then_z2_z4_ratio_changes():
     assert final_z4_ratio == 100 / 14.0
     assert final_z4_ratio != initial_z4_ratio
     assert final_z4_ratio < initial_z4_ratio  # cost grew → ratio shrunk
-
-
-def test_simulate_swaps_unsupported_raises():
-    prof, refs = _three_layer_mlp_prof()
-    Z1 = refs["Z1"]
-    fake_meta = ActivationMeta(node=Z1, size=100, last_fwd_idx=0, first_bwd_idx=1)
-    with pytest.raises(NotImplementedError):
-        simulate(prof, recomps={}, swaps={Z1: fake_meta})
 
 
 # ---------------------------------------------------------------------------

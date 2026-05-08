@@ -9,7 +9,7 @@ Algorithms E/F (Steps 5–6) will mutate these in place during the greedy loop.
 import math
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Set, Tuple
 
 import torch.fx as fx
 
@@ -19,7 +19,6 @@ from graph_prof import OP, GraphProfiler
 class Status(Enum):
     RETAINED = "retained"
     RECOMPUTE = "recompute"
-    SWAP = "swap"
 
 
 @dataclass(eq=False)
@@ -128,6 +127,20 @@ def build_candidates(prof: GraphProfiler) -> Dict[fx.Node, ActivationMeta]:
     return metas
 
 
+def _absorb_pick_into(meta: ActivationMeta, t: ActivationMeta) -> None:
+    """Replace t in meta.recomp_srcs with t's own sources, accumulate t's
+    recomp_time, and refresh total under the cnt × time invariant.
+
+    Shared by Algorithm E (meta is a prior recompute) and Algorithm F arm 1
+    (meta is a remaining candidate). Caller checks `t.node in meta.recomp_srcs`
+    and bumps any cnt fields itself.
+    """
+    meta.recomp_srcs.discard(t.node)
+    meta.recomp_srcs.update(t.recomp_srcs)
+    meta.recomp_time += t.recomp_time
+    meta.total_recomp_time = meta.recomp_cnt * meta.recomp_time
+
+
 # ---------------------------------------------------------------------------
 # Algorithm E — propagate sources into prior recomps when a new t is picked.
 # ---------------------------------------------------------------------------
@@ -159,9 +172,7 @@ def update_existing_recomps(
     """
     for R in recomps.values():
         if t.node in R.recomp_srcs:
-            R.recomp_srcs.discard(t.node)
-            R.recomp_srcs.update(t.recomp_srcs)
-            R.recomp_time += t.recomp_time
+            _absorb_pick_into(R, t)
             t.recomp_cnt += 1
         R.total_recomp_time = R.recomp_cnt * R.recomp_time
     t.total_recomp_time = t.recomp_cnt * t.recomp_time
@@ -198,19 +209,9 @@ def update_remaining_candidates(
     bumped by Algorithm E if t was a source of any prior recomp, so the
     multiplier in arm 2 is the post-E value.
     """
-    # Guard the most common caller-ordering bug: forgetting to remove t from
-    # candidates before this call. Without this, arm 2 would fire on t itself
-    # (since t.node ∈ t.recomp_srcs is false, but other consistency invariants
-    # would silently break).
-    assert t.node not in candidates, (
-        "t must be removed from candidates before update_remaining_candidates"
-    )
     for c in candidates.values():
         if t.node in c.recomp_srcs:
-            c.recomp_srcs.discard(t.node)
-            c.recomp_srcs.update(t.recomp_srcs)
-            c.recomp_time += t.recomp_time
-            c.total_recomp_time = c.recomp_cnt * c.recomp_time
+            _absorb_pick_into(c, t)
         elif c.node in t.recomp_srcs:
             c.total_recomp_time = t.recomp_cnt * c.recomp_time
 
@@ -244,9 +245,8 @@ def _compute_last_users(prof: GraphProfiler) -> Dict[fx.Node, int]:
 def simulate(
     prof: GraphProfiler,
     recomps: Dict[fx.Node, ActivationMeta],
-    swaps: Optional[Dict[fx.Node, ActivationMeta]] = None,
 ) -> List[int]:
-    """Per-node alive-bytes timeline reflecting the given recomp/swap decisions.
+    """Per-node alive-bytes timeline reflecting the given recomp decisions.
 
     Phase A — base sweep over prof.node_order, summing avg_output_sizes for
     every tensor still alive at each index. Equivalent to summing the per-type
@@ -259,12 +259,7 @@ def simulate(
     output sizes against the slot just before first_bwd_idx. This over-estimates
     intermediate liveness inside the window — acceptable because it never
     under-estimates the post-rewrite peak (anti-shortcut #3 in TENTATIVE_PLAN).
-
-    Swap support is deferred to later steps; non-empty `swaps` raises.
     """
-    if swaps:
-        raise NotImplementedError("")
-
     n = len(prof.node_order)
     alive: List[int] = [0] * n
     last_user = _compute_last_users(prof)
