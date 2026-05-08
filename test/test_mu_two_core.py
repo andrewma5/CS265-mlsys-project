@@ -1224,15 +1224,17 @@ def test_greedy_cascading_picks_meets_budget():
 
 def test_greedy_infeasible_budget_returns_false_no_exception():
     """budget=0 is unreachable — params/ops always have nonzero peak. Loop
-    must exhaust candidates and return reached_budget=False without raising."""
+    must return reached_budget=False without raising. With the peak-aware
+    gate, the loop exits as soon as no remaining candidate intersects the
+    current peak, so the pick count is implementation-defined; we only pin
+    the contract that matters (reached=False, dict-of-meta type)."""
     from mu_two_scheduler import greedy_recompute
 
     prof, _ = _build_chain_fixture()
     recomps, reached = greedy_recompute(prof, budget=0)
 
     assert reached is False
-    # All 4 activations should have been picked (loop runs until candidates empty).
-    assert len(recomps) == 4
+    assert isinstance(recomps, dict)
 
 
 def test_greedy_recompute_resnet18_smoke():

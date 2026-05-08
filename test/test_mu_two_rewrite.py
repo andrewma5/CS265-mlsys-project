@@ -103,8 +103,13 @@ def _run_tinymodel_rewrite(budget_fraction: float):
 
     torch.manual_seed(0)
     dev = torch.device("cuda:0")
+    # bs=32 leaves params+Adam-state dominating peak, so peak_idx falls in the
+    # opt step where no activation's (last_fwd_idx, first_bwd_idx) interval
+    # reaches — the peak-aware gate would (correctly) refuse all picks. bs=512
+    # makes activations the dominant memory term in the fwd→bwd gap, where
+    # picks can actually lower peak.
     model = _TinyModel().to(dev)
-    batch = torch.randn(32, 64, device=dev)
+    batch = torch.randn(512, 64, device=dev)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3, foreach=True, capturable=True)
     for p in model.parameters():
         if p.requires_grad:
@@ -215,7 +220,12 @@ def test_rewrite_resnet18():
     from mu_two_scheduler import greedy_recompute
 
     torch.cuda.empty_cache()
-    exp = Experiment("Resnet18", batch_size=4)
+    # bs=64: at small batches the param + Adam-state floor dominates the peak,
+    # so simulate(recomps={}) ≈ simulate(recomps=anything) and greedy runs to
+    # exhaustion rewriting all candidates — slow and uninteresting. bs=64 makes
+    # activations the dominant memory term, so a 70% budget cut is achievable
+    # with a handful of picks.
+    exp = Experiment("Resnet18", batch_size=64)
     exp.init_opt_states()
 
     captured = {}
@@ -244,7 +254,11 @@ def test_rewrite_resnet18():
         _restore(args, snap)
         with torch.no_grad():
             new = gm2(*args)
-        new_flat = _flatten(new)
+        # Clone immediately: graph_tracer.compile re-runs gm2 with these same
+        # args after xform returns, mutating the parameter tensors in place.
+        # Without the clone, new_flat would reflect "params after 2 train steps"
+        # vs baseline_flat at "after 1 step".
+        new_flat = [t.detach().clone() for t in _flatten(new)]
 
         captured["baseline"] = baseline_flat
         captured["new"] = new_flat
@@ -264,6 +278,95 @@ def test_rewrite_resnet18():
     _assert_allclose(
         captured["baseline"], captured["new"],
         rtol=1e-3, atol=1e-3, label="resnet18",
+    )
+
+    del exp, compiled
+    torch.cuda.empty_cache()
+
+
+# ---------------------------------------------------------------------------
+# Resnet50 — same pipeline, bigger graph. Diagnostic at 0.7 × baseline_peak.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_rewrite_resnet50():
+    from benchmarks import Experiment
+    from graph_prof import GraphProfiler
+    from graph_tracer import compile
+    from mu_two_core import simulate
+    from mu_two_rewrite import rewrite_recomputes
+    from mu_two_scheduler import greedy_recompute
+
+    torch.cuda.empty_cache()
+    # See test_rewrite_resnet18 for batch-size rationale. Resnet50 has 4× the
+    # params of Resnet18 so we need bs≥16 to push peak above the param floor.
+    exp = Experiment("Resnet50", batch_size=16)
+    exp.init_opt_states()
+
+    captured = {}
+
+    def xform(gm, args):
+        prof = GraphProfiler(gm)
+        with torch.no_grad():
+            for _ in range(2):
+                prof.run(*args)
+            prof.reset_stats()
+            for _ in range(3):
+                prof.run(*args)
+        prof.aggregate_stats()
+
+        snap = _snapshot(args)
+        with torch.no_grad():
+            baseline = gm(*args)
+        baseline_flat = [t.detach().clone() for t in _flatten(baseline)]
+
+        baseline_peak = max(simulate(prof, recomps={}))
+        budget = int(baseline_peak * 0.7)
+        recomps, reached = greedy_recompute(prof, budget=budget)
+        final_peak = max(simulate(prof, recomps))
+
+        n_nodes_before = sum(1 for _ in gm.graph.nodes)
+        gm2 = rewrite_recomputes(gm, prof, recomps)
+        n_nodes_after = sum(1 for _ in gm2.graph.nodes)
+
+        _restore(args, snap)
+        with torch.no_grad():
+            new = gm2(*args)
+        # See test_rewrite_resnet18 — must clone, not reference.
+        new_flat = [t.detach().clone() for t in _flatten(new)]
+
+        captured["baseline"] = baseline_flat
+        captured["new"] = new_flat
+        captured["picks"] = len(recomps)
+        captured["reached"] = reached
+        captured["baseline_mb"] = baseline_peak / 1e6
+        captured["budget_mb"] = budget / 1e6
+        captured["final_mb"] = final_peak / 1e6
+        captured["nodes_before"] = n_nodes_before
+        captured["nodes_after"] = n_nodes_after
+        captured["max_recomp_cnt"] = max(
+            (m.recomp_cnt for m in recomps.values()), default=0
+        )
+        return gm2
+
+    compiled = compile(exp.train_step, xform)
+    compiled(exp.model, exp.optimizer, exp.example_inputs)
+
+    print(
+        f"\n[resnet50 rewrite] picks={captured['picks']} "
+        f"reached_budget={captured['reached']} "
+        f"baseline_mb={captured['baseline_mb']:.1f} "
+        f"budget_mb={captured['budget_mb']:.1f} "
+        f"final_mb={captured['final_mb']:.1f} "
+        f"nodes={captured['nodes_before']}->{captured['nodes_after']} "
+        f"max_recomp_cnt={captured['max_recomp_cnt']}"
+    )
+    # Resnet conv reduction order amplifies fp32 noise across the rewrite —
+    # match Resnet18 tolerance.
+    _assert_allclose(
+        captured["baseline"], captured["new"],
+        rtol=1e-3, atol=1e-3, label="resnet50",
     )
 
     del exp, compiled
